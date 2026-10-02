@@ -656,6 +656,194 @@ describe("ProductionCampaignHover", () => {
 		);
 
 	it.each([
+		["entry", "matching receipt", "late resolve"],
+		["layer", "matching receipt", "late resolve"],
+		["entry", "matching receipt", "abort rejection"],
+		["layer", "matching receipt", "abort rejection"],
+		["entry", "malformed receipt", "late resolve"],
+		["layer", "malformed receipt", "late resolve"],
+		["entry", "unqualified withdrawal", "late resolve"],
+		["layer", "unqualified withdrawal", "late resolve"],
+		["entry", "401", "late resolve"],
+		["layer", "401", "late resolve"],
+		["entry", "403", "late resolve"],
+		["layer", "403", "late resolve"],
+	] as const)(
+		"promptly withdraws %s on %s with a pending sibling (%s)",
+		async (placement, answer, siblingBehavior) => {
+			vi.useFakeTimers();
+			const addListener = vi.spyOn(AbortSignal.prototype, "addEventListener");
+			const removeListener = vi.spyOn(AbortSignal.prototype, "removeEventListener");
+			let resolveSibling!: (response: Response) => void;
+			const pendingSibling = new Promise<Response>((resolve) => { resolveSibling = resolve; });
+			let siblingSignal!: AbortSignal;
+			const abortSpy = vi.fn();
+			const fetchMock = vi.fn((url: string, init: RequestInit) => {
+				const key = url.includes("hover-entry") ? "opend.home.hover-entry" : "opend.home.hover-layer";
+				if (fetchMock.mock.calls.length <= 2)
+					return Promise.resolve(new Response(JSON.stringify(decision(key)), { status: 200 }));
+				if (!key.endsWith(placement)) {
+					siblingSignal = init.signal!;
+					if (siblingBehavior === "abort rejection")
+						return new Promise<Response>((_resolve, reject) => {
+							siblingSignal.addEventListener("abort", () => {
+								abortSpy();
+								reject(new DOMException("aborted", "AbortError"));
+							}, { once: true });
+						});
+					return pendingSibling;
+				}
+				const response = answer === "matching receipt" ? revocation(decision(key))
+					: answer === "malformed receipt" ? new Response(JSON.stringify({ error: "production_runtime_revoked", receipt: { touchpointDecisionId: "incomplete" } }), { status: 410 })
+					: answer === "unqualified withdrawal" ? new Response(null, { status: 410 })
+					: new Response(null, { status: Number(answer) });
+				return Promise.resolve(response);
+			});
+			vi.stubGlobal("fetch", fetchMock);
+			await act(async () => {
+				render(<ProductionCampaignHover authenticated sessionSubject="account-a" />);
+			});
+			expect(screen.getByTestId("production-hover-overlay")).toBeTruthy();
+			await act(async () => { await vi.advanceTimersByTimeAsync(29_999); });
+			expect(fetchMock).toHaveBeenCalledTimes(2);
+			await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+			expect(fetchMock).toHaveBeenCalledTimes(4);
+			expect(fetchMock.mock.calls[2]?.[0]).toContain("activeDecisionId=decision-opend.home.hover-entry");
+			expect(fetchMock.mock.calls[3]?.[0]).toContain("activeDecisionId=decision-opend.home.hover-layer");
+			// Clear while the sibling is still pending, before the 15s request budget.
+			expect(screen.queryByTestId("production-hover-overlay")).toBeNull();
+			expect(siblingSignal.aborted).toBe(true);
+			if (siblingBehavior === "abort rejection") expect(abortSpy).toHaveBeenCalledTimes(1);
+			if (answer !== "matching receipt")
+				expect(diagnosticSpy).toHaveBeenCalledWith({ code: "touchpoint_load_failed", detail: `http_${answer === "401" || answer === "403" ? answer : "410"}` });
+			else expect(diagnosticSpy).not.toHaveBeenCalled();
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(15_000);
+				resolveSibling(new Response(JSON.stringify(decision(`opend.home.hover-${placement === "entry" ? "layer" : "entry"}`)), { status: 200 }));
+			});
+			expect(screen.queryByTestId("production-hover-overlay")).toBeNull();
+			expect(fetchMock).toHaveBeenCalledTimes(4);
+			// Every lifecycle-to-pair forwarding listener is removed on completion.
+			for (const [index, args] of addListener.mock.calls.entries()) {
+				if (args[0] !== "abort" || addListener.mock.contexts[index] === siblingSignal) continue;
+				expect(removeListener.mock.calls.some((removed, removedIndex) =>
+					removed[0] === "abort" && removed[1] === args[1] &&
+					removeListener.mock.contexts[removedIndex] === addListener.mock.contexts[index],
+				)).toBe(true);
+			}
+		},
+	);
+
+	it.each([
+		["entry", "touchpointDecisionId"], ["layer", "touchpointDecisionId"],
+		["entry", "deploymentId"], ["layer", "deploymentId"],
+		["entry", "activityId"], ["layer", "activityId"],
+		["entry", "contentVersionId"], ["layer", "contentVersionId"],
+		["entry", "other placement"], ["layer", "other placement"],
+	] as const)("retains %s for a mismatched %s while its sibling is pending", async (placement, field) => {
+		vi.useFakeTimers();
+		let resolveSibling!: (response: Response) => void;
+		const pending = new Promise<Response>((resolve) => { resolveSibling = resolve; });
+		let siblingSignal!: AbortSignal;
+		const fetchMock = vi.fn((url: string, init: RequestInit) => {
+			const key = url.includes("hover-entry") ? "opend.home.hover-entry" : "opend.home.hover-layer";
+			if (fetchMock.mock.calls.length <= 2)
+				return Promise.resolve(new Response(JSON.stringify(decision(key)), { status: 200 }));
+			if (!key.endsWith(placement)) { siblingSignal = init.signal!; return pending; }
+			return Promise.resolve(field === "other placement"
+				? revocation(decision(`opend.home.hover-${placement === "entry" ? "layer" : "entry"}`))
+				: revocation(decision(key), { [field]: "older-identity" }));
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		await act(async () => { render(<ProductionCampaignHover authenticated sessionSubject="account-a" />); });
+		const mounted = screen.getByTestId("production-hover-overlay");
+		await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+		expect(fetchMock).toHaveBeenCalledTimes(4);
+		expect(screen.getByTestId("production-hover-overlay")).toBe(mounted);
+		expect(siblingSignal.aborted).toBe(false);
+		await act(async () => {
+			resolveSibling(new Response(JSON.stringify(decision(`opend.home.hover-${placement === "entry" ? "layer" : "entry"}`)), { status: 200 }));
+		});
+		expect(screen.getByTestId("production-hover-overlay")).toBe(mounted);
+		expect(siblingSignal.aborted).toBe(true);
+		expect(diagnosticSpy).not.toHaveBeenCalled();
+	});
+
+	it("updates a pair only after both coherent new grants arrive", async () => {
+		vi.useFakeTimers();
+		const resolvers: Array<(response: Response) => void> = [];
+		const fetchMock = vi.fn((url: string) => fetchMock.mock.calls.length <= 2
+			? Promise.resolve(new Response(JSON.stringify(decision(url.includes("hover-entry") ? "opend.home.hover-entry" : "opend.home.hover-layer")), { status: 200 }))
+			: new Promise<Response>((resolve) => { resolvers.push(resolve); }));
+		vi.stubGlobal("fetch", fetchMock);
+		await act(async () => { render(<ProductionCampaignHover authenticated sessionSubject="account-a" />); });
+		const latestEntry = () => (overlaySpy.mock.lastCall?.[0] as { entry: { id: string } }).entry.id;
+		await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+		const next = (key: string) => new Response(JSON.stringify(decision(key, {
+			deploymentId: "deployment-2", content: { ...content(key), id: `next-${key}` },
+		})), { status: 200 });
+		await act(async () => { resolvers[0]!(next("opend.home.hover-entry")); });
+		expect(latestEntry()).toBe("version-opend.home.hover-entry");
+		await act(async () => { resolvers[1]!(next("opend.home.hover-layer")); });
+		expect(latestEntry()).toBe("next-opend.home.hover-entry");
+	});
+
+	it.each(["account", "locale"] as const)("fences a late matching withdrawal after a %s change", async (change) => {
+		vi.useFakeTimers();
+		let resolveLate!: (response: Response) => void;
+		const pending = new Promise<Response>((resolve) => { resolveLate = resolve; });
+		let pendingSignal!: AbortSignal;
+		const fetchMock = vi.fn((url: string, init: RequestInit) => {
+			const key = url.includes("hover-entry") ? "opend.home.hover-entry" : "opend.home.hover-layer";
+			if (fetchMock.mock.calls.length === 4) { pendingSignal = init.signal!; return pending; }
+			const fresh = fetchMock.mock.calls.length > 2;
+			return Promise.resolve(new Response(JSON.stringify(decision(key, { content: {
+				...content(key), id: fresh ? `fresh-${key}` : `version-${key}`,
+				locale: url.includes("locale=zh-CN") ? "zh-CN" : "en-US",
+			} })), { status: 200 }));
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		const element = (subject: string) => <I18nProvider initial="en"><LocaleSwitch /><ProductionCampaignHover authenticated sessionSubject={subject} /></I18nProvider>;
+		let view!: ReturnType<typeof render>;
+		await act(async () => { view = render(element("account-a")); });
+		await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+		expect((overlaySpy.mock.lastCall?.[0] as { entry: { id: string } }).entry.id).toBe("version-opend.home.hover-entry");
+		await act(async () => {
+			if (change === "account") view.rerender(element("account-b"));
+			else screen.getByRole("button", { name: "Switch locale" }).click();
+		});
+		expect(pendingSignal.aborted).toBe(true);
+		expect(fetchMock).toHaveBeenCalledTimes(6);
+		const mounted = screen.getByTestId("production-hover-overlay");
+		expect((overlaySpy.mock.lastCall?.[0] as { entry: { id: string } }).entry.id).toBe("fresh-opend.home.hover-entry");
+		await act(async () => { resolveLate(revocation(decision("opend.home.hover-layer"))); });
+		expect(screen.getByTestId("production-hover-overlay")).toBe(mounted);
+		expect(diagnosticSpy).not.toHaveBeenCalled();
+	});
+
+	it("removes abort forwarding on unmount even when both transports ignore cancellation", async () => {
+		vi.useFakeTimers();
+		const addListener = vi.spyOn(AbortSignal.prototype, "addEventListener");
+		const removeListener = vi.spyOn(AbortSignal.prototype, "removeEventListener");
+		const rejectors: Array<(error: unknown) => void> = [];
+		const signals: AbortSignal[] = [];
+		vi.stubGlobal("fetch", vi.fn((_url: string, init: RequestInit) => {
+			signals.push(init.signal!);
+			return new Promise<Response>((_resolve, reject) => { rejectors.push(reject); });
+		}));
+		const view = render(<ProductionCampaignHover authenticated sessionSubject="account-a" />);
+		expect(signals).toHaveLength(2);
+		await act(async () => { view.unmount(); });
+		expect(signals.every((signal) => signal.aborted)).toBe(true);
+		const forwarding = addListener.mock.calls.find(([type]) => type === "abort");
+		expect(forwarding).toBeDefined();
+		expect(removeListener).toHaveBeenCalledWith("abort", forwarding![1]);
+		await act(async () => { rejectors.forEach((reject) => reject(new TypeError("late transport failure"))); });
+		expect(screen.queryByTestId("production-hover-overlay")).toBeNull();
+		expect(diagnosticSpy).not.toHaveBeenCalled();
+	});
+
+	it.each([
 		["entry revoked while layer unavailable", "match", "transient", true],
 		["layer revoked while entry unavailable", "transient", "match", true],
 		["unrelated receipt while layer unavailable", "mismatch", "transient", false],

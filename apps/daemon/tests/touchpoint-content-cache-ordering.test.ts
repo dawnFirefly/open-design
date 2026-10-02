@@ -7,6 +7,7 @@
 //
 // Local files and a virtual clock only, no sockets.
 import { createHash } from 'node:crypto';
+import fs from 'node:fs';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -68,11 +69,187 @@ beforeEach(() => {
   dataDir = mkdtempSync(path.join(tmpdir(), 'touchpoint-ordering-'));
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.useRealTimers();
   rmSync(dataDir, { recursive: true, force: true });
 });
 
 describe('touchpoint content cache answer ordering', () => {
+  const ioFailure = () => Object.assign(new Error('injected cache storage failure'), { code: 'EACCES' });
+
+  it.each([401, 403, 404] as const)('persists refusal after %s when atomic replacement fails', status => {
+    const cache = createTouchpointContentCache(dataDir);
+    cache.remember(key, full({ serverTime: 0, endsAt: HOUR }));
+    const held = cache.held(key);
+    vi.spyOn(fs, 'renameSync').mockImplementation(() => { throw ioFailure(); });
+    cache.refuseReplay(key, status);
+    expect(cache.held(key)).toEqual(held);
+    expect(cache.replayOffline(key, 'upstream_unavailable')).toBeNull();
+    vi.restoreAllMocks();
+    expect(replayAfterRestart()).toBeNull();
+  });
+
+  it('persists a matching withdrawal before failed deletion and never replays it after restart', () => {
+    const cache = createTouchpointContentCache(dataDir);
+    const grant = full({ serverTime: 0, endsAt: HOUR });
+    cache.remember(key, grant);
+    vi.spyOn(fs, 'rmSync').mockImplementation(() => { throw ioFailure(); });
+    cache.forgetWithdrawn(key, { error: 'production_runtime_revoked', receipt: {
+      activityId: grant.activityId, deploymentId: grant.deploymentId,
+      contentVersionId: grant.content.id, touchpointDecisionId: grant.touchpointDecisionId,
+    } });
+    expect(cache.replayOffline(key, 'upstream_unavailable')).toBeNull();
+    vi.restoreAllMocks();
+    expect(replayAfterRestart()).toBeNull();
+  });
+
+  it.each([401, 403, 404, 410] as const)('fails closed after %s while the cache cannot be written or deleted', status => {
+    const cache = createTouchpointContentCache(dataDir);
+    cache.remember(key, full({ serverTime: 0, endsAt: HOUR }));
+    expect(cache.replayOffline(key, 'upstream_unavailable')).not.toBeNull();
+    vi.spyOn(fs, 'writeFileSync').mockImplementation(() => { throw ioFailure(); });
+    vi.spyOn(fs, 'rmSync').mockImplementation(() => { throw ioFailure(); });
+    if (status === 410) cache.forgetWithdrawn(key, null);
+    else cache.refuseReplay(key, status);
+    expect(cache.replayOffline(key, 'upstream_unavailable')).toBeNull();
+    // A cold reader under the same storage fault cannot advance its authority either.
+    expect(replayAfterRestart()).toBeNull();
+  });
+
+  it('keeps refusal in memory after storage recovers until a fresh grant is durably stored', () => {
+    const cache = createTouchpointContentCache(dataDir);
+    cache.remember(key, full({ serverTime: 0, endsAt: HOUR }));
+    const held = cache.held(key)!;
+    const write = vi.spyOn(fs, 'writeFileSync').mockImplementation(() => { throw ioFailure(); });
+    cache.refuseReplay(key, 401);
+    vi.advanceTimersByTime(1_000);
+    cache.reassemble(key, held, trimmed({ serverTime: 1_000, endsAt: HOUR }), cache.ticket(key));
+    write.mockRestore();
+    expect(cache.replayOffline(key, 'upstream_unavailable')).toBeNull();
+    expect(replayAfterRestart()).toBeNull(); // The recovered store now remembers the refusal.
+    cache.reassemble(key, held, trimmed({ serverTime: 1_000, endsAt: HOUR }), cache.ticket(key));
+    expect(cache.replayOffline(key, 'upstream_unavailable')).not.toBeNull();
+    expect(replayAfterRestart()).not.toBeNull();
+  });
+
+  it.each([401, 403] as const)('refuses the account after %s even if directory enumeration fails', status => {
+    const cache = createTouchpointContentCache(dataDir);
+    const alias = { ...key, locale: 'zh-TW' };
+    const account = { ...key, scope: 'production:B' };
+    const environment = { ...key, scope: 'test:A' };
+    for (const candidate of [key, alias, account, environment])
+      cache.remember(candidate, full({ serverTime: 0, endsAt: HOUR }));
+    const read = vi.spyOn(fs, 'readdirSync').mockImplementation(() => { throw ioFailure(); });
+    cache.refuseReplay(key, status);
+    read.mockRestore();
+    expect(cache.replayOffline(key, 'upstream_unavailable')).toBeNull();
+    expect(createTouchpointContentCache(dataDir).replayOffline(alias, 'upstream_unavailable')).toBeNull();
+    expect(cache.replayOffline(alias, 'upstream_unavailable')).toBeNull();
+    expect(cache.replayOffline(account, 'upstream_unavailable')).not.toBeNull();
+    expect(cache.replayOffline(environment, 'upstream_unavailable')).not.toBeNull();
+    vi.advanceTimersByTime(1_000);
+    cache.remember(key, full({ serverTime: 1_000, endsAt: HOUR }), cache.ticket(key));
+    expect(cache.replayOffline(key, 'upstream_unavailable')).not.toBeNull();
+    expect(cache.replayOffline(alias, 'upstream_unavailable')).toBeNull();
+  });
+
+  it('continues retiring other cached languages when the first record cannot be persisted', () => {
+    const cache = createTouchpointContentCache(dataDir);
+    const alias = { ...key, locale: 'zh-TW' };
+    for (const candidate of [key, alias])
+      cache.remember(candidate, full({ serverTime: 0, endsAt: HOUR }));
+    const first = records()[0]!;
+    const writeFile = fs.writeFileSync.bind(fs);
+    vi.spyOn(fs, 'writeFileSync').mockImplementation((file, ...args) => {
+      if (String(file).includes(path.basename(first, '.json'))) throw ioFailure();
+      return writeFile(file, ...args);
+    });
+    cache.refuseReplay(key, 403);
+    for (const candidate of [key, alias])
+      expect(cache.replayOffline(candidate, 'upstream_unavailable')).toBeNull();
+    const persisted = records().filter(name => name !== first)
+      .map(name => JSON.parse(fs.readFileSync(path.join(dataDir, name), 'utf8')));
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0].replayRefused).toBe(true);
+  });
+
+  it.each([401, 403] as const)('keeps account refusal after %s when an assembly temporarily cannot be read', status => {
+    const cache = createTouchpointContentCache(dataDir);
+    cache.remember(key, full({ serverTime: 0, endsAt: HOUR }));
+    const readFile = fs.readFileSync.bind(fs);
+    const read = vi.spyOn(fs, 'readFileSync').mockImplementation((file, ...args) => {
+      if (String(file).includes('/assemblies/')) throw ioFailure();
+      return readFile(file, ...args);
+    });
+    cache.refuseReplay(key, status);
+    read.mockRestore();
+    expect(cache.replayOffline(key, 'upstream_unavailable')).toBeNull();
+    expect(replayAfterRestart()).toBeNull();
+  });
+
+  it.each(['unqualified', 'matching'] as const)('remembers a %s withdrawal when directory enumeration fails', kind => {
+    const cache = createTouchpointContentCache(dataDir);
+    const alias = { ...key, locale: 'zh-TW' };
+    const unrelated = { ...key, locale: 'ja-JP' };
+    for (const candidate of [key, alias])
+      cache.remember(candidate, full({ serverTime: 0, endsAt: HOUR }));
+    cache.remember(unrelated, { ...full({ serverTime: 0, endsAt: HOUR }), deploymentId: 'deployment-2' });
+    const lateTicket = cache.ticket(alias);
+    const held = cache.held(alias)!;
+    const read = vi.spyOn(fs, 'readdirSync').mockImplementation(() => { throw ioFailure(); });
+    cache.forgetWithdrawn(key, kind === 'unqualified' ? null : { error: 'production_runtime_revoked', receipt: {
+      activityId: 'activity-1', deploymentId: 'deployment-1', contentVersionId: 'version-1', touchpointDecisionId: 'decision-1',
+    } });
+    read.mockRestore();
+    cache.remember(alias, full({ serverTime: 1_000, endsAt: HOUR }), lateTicket);
+    cache.reassemble(alias, held, trimmed({ serverTime: 1_000, endsAt: HOUR }), lateTicket);
+    expect(cache.replayOffline(key, 'upstream_unavailable')).toBeNull();
+    expect(createTouchpointContentCache(dataDir).replayOffline(alias, 'upstream_unavailable')).toBeNull();
+    for (const candidate of [key, alias])
+      expect(cache.replayOffline(candidate, 'upstream_unavailable')).toBeNull();
+    if (kind === 'matching') expect(cache.replayOffline(unrelated, 'upstream_unavailable')).not.toBeNull();
+    else expect(cache.replayOffline(unrelated, 'upstream_unavailable')).toBeNull();
+    expect(replayAfterRestart()).toBeNull();
+    vi.advanceTimersByTime(1_000);
+    cache.remember(key, full({ serverTime: 1_000, endsAt: HOUR }), cache.ticket(key));
+    expect(cache.replayOffline(key, 'upstream_unavailable')).not.toBeNull();
+    expect(cache.replayOffline(alias, 'upstream_unavailable')).toBeNull();
+  });
+
+  it('keeps a different delivery displayable when matching withdrawal deletion fails', () => {
+    const cache = createTouchpointContentCache(dataDir);
+    const alias = { ...key, locale: 'zh-TW' };
+    const unrelated = { ...key, locale: 'ja-JP' };
+    for (const candidate of [key, alias])
+      cache.remember(candidate, full({ serverTime: 0, endsAt: HOUR }));
+    cache.remember(unrelated, { ...full({ serverTime: 0, endsAt: HOUR }), deploymentId: 'deployment-2' });
+    vi.spyOn(fs, 'rmSync').mockImplementation(() => { throw ioFailure(); });
+    cache.forgetWithdrawn(key, { error: 'production_runtime_revoked', receipt: {
+      activityId: 'activity-1', deploymentId: 'deployment-1', contentVersionId: 'version-1', touchpointDecisionId: 'decision-1',
+    } });
+    for (const candidate of [key, alias])
+      expect(cache.replayOffline(candidate, 'upstream_unavailable')).toBeNull();
+    expect(cache.replayOffline(unrelated, 'upstream_unavailable')).not.toBeNull();
+    vi.restoreAllMocks();
+    expect(createTouchpointContentCache(dataDir).replayOffline(unrelated, 'upstream_unavailable')).not.toBeNull();
+  });
+
+  it.each([401, 410] as const)('retires unvisited locales when a fresh online grant recovers storage after %s', status => {
+    const cache = createTouchpointContentCache(dataDir);
+    const alias = { ...key, locale: 'zh-TW' };
+    for (const candidate of [key, alias])
+      cache.remember(candidate, full({ serverTime: 0, endsAt: HOUR }));
+    const read = vi.spyOn(fs, 'readdirSync').mockImplementation(() => { throw ioFailure(); });
+    if (status === 410) cache.forgetWithdrawn(key, null);
+    else cache.refuseReplay(key, status);
+    read.mockRestore();
+    vi.advanceTimersByTime(1_000);
+    cache.remember(key, full({ serverTime: 1_000, endsAt: HOUR }), cache.ticket(key));
+    const restarted = createTouchpointContentCache(dataDir);
+    expect(restarted.replayOffline(key, 'upstream_unavailable')).not.toBeNull();
+    expect(restarted.replayOffline(alias, 'upstream_unavailable')).toBeNull();
+  });
+
   it('requires a fresh grant after refusal, including a trimmed renewal', () => {
     const cache = createTouchpointContentCache(dataDir);
     cache.remember(key, full({ serverTime: 0, endsAt: HOUR }));

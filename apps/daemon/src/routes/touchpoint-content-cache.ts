@@ -272,6 +272,18 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
   const bootMonotonic = performance.now();
   /** Per-key: the highest time this process adopted, and the monotonic reading it was adopted at. */
   const marks = new Map<string, { wall: number; at: number }>();
+  // Storage failure cannot turn an authoritative refusal into display authority.
+  // A successful fresh grant is the only operation that clears a local block.
+  const refusedFiles = new Set<string>();
+  const refusedScopes = new Map<string, Set<string>>();
+  const pendingWithdrawals = new Map<string, {
+    scope: string;
+    placementKey: string;
+    body: unknown;
+    renewed: Set<string>;
+    through: number;
+    observedAt: number;
+  }>();
   const nowEstimate = (): number =>
     Math.max(Date.now(), Math.round(bootWall + (performance.now() - bootMonotonic)));
 
@@ -296,6 +308,25 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
         /* the temp file is already gone or unremovable; neither changes the outcome */
       }
       throw error;
+    }
+  };
+
+  /** Retire authority before deleting bytes; a failed rename may still permit overwriting the record. */
+  const retireReplay = (file: string, record: AssemblyRecord): boolean => {
+    refusedFiles.add(file);
+    const retired = JSON.stringify({ ...record, replayRefused: true });
+    try {
+      writeFileAtomically(file, retired);
+      return true;
+    } catch {
+      try {
+        // This fallback only removes authority. A partial write is invalid JSON
+        // and therefore a cache miss; it can never manufacture a fresh grant.
+        fs.writeFileSync(file, retired);
+        return true;
+      } catch {
+        return false;
+      }
     }
   };
 
@@ -475,6 +506,7 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
   const liveRecordIn = (
     file: string,
     record: AssemblyRecord,
+    requirePersistence = false,
   ): { record: AssemblyRecord; schedule: TouchpointSchedule; now: number } | null => {
     const schedule = record.schedule ? touchpointScheduleOf(record.schedule) : null;
     if (!schedule) return null;
@@ -496,14 +528,17 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
     const projected = anchor ? anchor.wall + (monotonicNow - anchor.at) : 0;
     const now = Math.max(record.clock.observedAt, projected, nowEstimate());
     marks.set(file, { wall: now, at: monotonicNow });
-    if (now > record.clock.observedAt) {
+    if (now > record.clock.observedAt || requirePersistence) {
       try {
         writeFileAtomically(
           file,
           JSON.stringify({ ...record, clock: { ...record.clock, observedAt: now } }),
         );
       } catch {
-        /* an un-advanceable mark is a weaker guarantee, never a wrong one */
+        // An offline grant requires a writable authority record, including on
+        // cold start. Otherwise a failed retirement/clock update could replay
+        // stale authority from a readable but unwritable store.
+        if (requirePersistence) return null;
       }
     }
     const elapsed = Math.max(0, now - record.clock.fetchedAt);
@@ -515,9 +550,9 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
     return { record, schedule, now: effective };
   };
 
-  const liveRecord = (key: TouchpointContentKey) => {
+  const liveRecord = (key: TouchpointContentKey, requirePersistence = false) => {
     const record = readAssembly(key);
-    return record ? liveRecordIn(assemblyFile(key), record) : null;
+    return record ? liveRecordIn(assemblyFile(key), record, requirePersistence) : null;
   };
 
   /**
@@ -597,9 +632,10 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
   const scopeFenceName = (scope: string): string => `scope:${scope}`;
   const placementFenceName = (key: TouchpointContentKey): string =>
     `placement:${key.scope}\u0000${key.placementKey}`;
-  const fenceGroup = (name: string): void => {
+  const fenceGroup = (name: string, through = tickets): void => {
+    const latest = Math.max(withdrawnThrough.get(name) ?? 0, through);
     withdrawnThrough.delete(name);
-    withdrawnThrough.set(name, tickets);
+    withdrawnThrough.set(name, latest);
     while (withdrawnThrough.size > MAX_REVOCATIONS) {
       const oldest = withdrawnThrough.keys().next().value;
       if (oldest === undefined) break;
@@ -612,13 +648,21 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
       withdrawnThrough.get(scopeFenceName(key.scope)) ?? 0,
       withdrawnThrough.get(placementFenceName(key)) ?? 0,
     );
+  const overtakenByPendingWithdrawal = (
+    key: TouchpointContentKey, response: unknown, ticket: number | undefined,
+  ): boolean => ticket !== undefined && [...pendingWithdrawals.values()].some(withdrawal =>
+    withdrawal.scope === key.scope && withdrawal.placementKey === key.placementKey &&
+    ticket <= withdrawal.through &&
+    touchpointWithdrawalReclaims(withdrawal.body, touchpointCachedIdentityOf(response)),
+  );
   const deliveryName = (scope: string, identity: TouchpointCachedIdentity): string =>
     [scope, identity.activityId, identity.deploymentId, identity.contentVersionId].join('\u0000');
-  const recordRevocation = (record: AssemblyRecord): void => {
+  const recordRevocation = (record: AssemblyRecord, observedAt?: number): void => {
     if (!record.identity) return;
     const name = deliveryName(record.scope, record.identity);
     revocations.delete(name);
-    revocations.set(name, serverTimeOf(record));
+    revocations.set(name, observedAt === undefined ? serverTimeOf(record) :
+      statedServerTimeOf(record) + Math.max(0, observedAt - record.clock.fetchedAt));
     while (revocations.size > MAX_REVOCATIONS) {
       const oldest = revocations.keys().next().value;
       if (oldest === undefined) break;
@@ -715,6 +759,46 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
 
   sweepExpired();
 
+  /** Recover all affected records together, so an unvisited locale cannot revive on restart. */
+  function retryRefusals(scope: string): void {
+    const account = refusedScopes.get(scope);
+    const withdrawals = [...pendingWithdrawals.entries()].filter(([, value]) => value.scope === scope);
+    if (!account && !withdrawals.length) return;
+    let entries: { file: string; record: AssemblyRecord | null }[];
+    try {
+      const dir = assembliesDirFor(scope);
+      entries = fs.readdirSync(dir).filter(name => name.endsWith('.json')).map(name => {
+        const file = path.join(dir, name);
+        return { file, record: parseAssembly(file) };
+      });
+    } catch {
+      return;
+    }
+    if (account) {
+      let persisted = true;
+      for (const { file, record } of entries) {
+        if (account.has(file)) continue;
+        if (!record) { persisted = false; continue; }
+        if (record.scope === scope && !retireReplay(file, record)) persisted = false;
+      }
+      if (persisted) refusedScopes.delete(scope);
+    }
+    for (const [name, withdrawal] of withdrawals) {
+      let persisted = true;
+      for (const { file, record } of entries) {
+        if (withdrawal.renewed.has(file)) continue;
+        if (!record) { persisted = false; continue; }
+        if (record.scope !== scope || record.placementKey !== withdrawal.placementKey ||
+          !touchpointWithdrawalReclaims(withdrawal.body, record.identity)) continue;
+        if (!retireReplay(file, record)) persisted = false;
+        recordRevocation(record, withdrawal.observedAt);
+        fenceGroup(`${scope}\u0000${path.basename(file, '.json')}`, withdrawal.through);
+        reclaim(file, record);
+      }
+      if (persisted) pendingWithdrawals.delete(name);
+    }
+  }
+
   return {
     activeDecisionId(key) {
       const id = readAssembly(key)?.identity?.touchpointDecisionId;
@@ -722,6 +806,7 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
     },
 
     held(key) {
+      retryRefusals(key.scope);
       const record = readAssembly(key);
       if (!record) return null;
       // Offering an (id, locale) the daemon cannot actually rebuild would turn
@@ -740,7 +825,8 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
       const record = readAssembly(key);
       if (!record || !recordStillHolds(record, held)) return null;
       const full = rebuild(key, record, trimmed);
-      if (full && !overtakenByWithdrawal(key, ticket)) adoptRenewal(key, record, full, trimmed, clock);
+      if (full && !overtakenByWithdrawal(key, ticket) && !overtakenByPendingWithdrawal(key, full, ticket))
+        adoptRenewal(key, record, full, trimmed, clock);
       return full;
     },
 
@@ -749,7 +835,22 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
     },
 
     replayOffline(key, reason) {
-      const live = liveRecord(key);
+      retryRefusals(key.scope);
+      const file = assemblyFile(key);
+      const scopeRefusal = refusedScopes.get(key.scope);
+      const stored = pendingWithdrawals.size ? readAssembly(key) : null;
+      const pendingWithdrawal = stored && [...pendingWithdrawals.values()].some(withdrawal =>
+        withdrawal.scope === key.scope && withdrawal.placementKey === key.placementKey &&
+        !withdrawal.renewed.has(file) && touchpointWithdrawalReclaims(withdrawal.body, stored.identity),
+      );
+      if (refusedFiles.has(file) || (scopeRefusal && !scopeRefusal.has(file)) || pendingWithdrawal) {
+        // If storage has recovered, persist the remembered refusal before a
+        // later restart. Recovery itself never grants display authority.
+        const refused = stored ?? readAssembly(key);
+        if (refused) retireReplay(file, refused);
+        return null;
+      }
+      const live = liveRecord(key, true);
       if (!live) return null;
       const { record, schedule, now } = live;
       if (record.replayRefused || !record.identity || !touchpointScheduleAllowsDisplay(schedule, now)) return null;
@@ -775,7 +876,16 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
       // An unqualified withdrawal applies to this placement in every requested
       // language. A receipt names a delivery, including its other cached locales.
       if (!receipt) fenceGroup(placementFenceName(key));
+      const withdrawalName = JSON.stringify([
+        key.scope, key.placementKey,
+        receipt ? [receipt.activityId, receipt.deploymentId, receipt.contentVersionId] : null,
+      ]);
+      pendingWithdrawals.set(withdrawalName, {
+        scope: key.scope, placementKey: key.placementKey, body, renewed: new Set(),
+        through: tickets, observedAt: nowEstimate(),
+      });
       let reclaimed = false;
+      let persisted = true;
       try {
         // Requested locale is encoded in the file name, not record.locale:
         // several requests may resolve to the same fallback language.
@@ -784,23 +894,35 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
           const file = path.join(dir, name);
           if (!name.endsWith('.json')) continue;
           const stored = parseAssembly(file);
-          if (!stored || stored.scope !== key.scope) continue;
+          if (!stored) { persisted = false; continue; }
+          if (stored.scope !== key.scope) continue;
           if (stored.placementKey !== key.placementKey) continue;
           if (!touchpointWithdrawalReclaims(body, stored.identity)) continue;
+          if (!retireReplay(file, stored)) persisted = false;
           recordRevocation(stored);
           fenceGroup(`${key.scope}\u0000${path.basename(name, '.json')}`);
           reclaim(file, stored);
           reclaimed = true;
         }
       } catch {
-        // An absent/unreadable store is a cache miss, never a proxy failure.
+        // Remember the withdrawal even when the records cannot yet be inspected.
+        persisted = false;
       }
+      if (persisted) pendingWithdrawals.delete(withdrawalName);
       return reclaimed;
     },
 
     refuseReplay(key, status) {
-      if (status === 404) fenceInFlight(key);
-      else fenceGroup(scopeFenceName(key.scope));
+      if (status === 404) {
+        fenceInFlight(key);
+        refusedFiles.add(assemblyFile(key));
+      } else {
+        fenceGroup(scopeFenceName(key.scope));
+        // Cover the whole account even if directory enumeration fails or one
+        // record cannot be persisted. Other accounts/environments stay usable.
+        refusedScopes.set(key.scope, new Set());
+      }
+      let persisted = true;
       try {
         const dir = assembliesDirFor(key.scope);
         for (const name of fs.readdirSync(dir)) {
@@ -808,12 +930,14 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
           const file = path.join(dir, name);
           if (status === 404 && file !== assemblyFile(key)) continue;
           const record = parseAssembly(file);
-          if (!record || record.scope !== key.scope) continue;
-          writeFileAtomically(file, JSON.stringify({ ...record, replayRefused: true }));
+          if (!record) { persisted = false; continue; }
+          if (record.scope !== key.scope) continue;
+          if (!retireReplay(file, record)) persisted = false;
         }
       } catch {
-        // Best effort, as with all cache writes. The response remains authoritative.
+        persisted = false;
       }
+      if (status !== 404 && persisted) refusedScopes.delete(key.scope);
     },
 
     remember(key, response, ticket, requestElapsedMs = 0) {
@@ -821,6 +945,7 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
         const clock = responseClock(requestElapsedMs);
         if (overtakenByWithdrawal(key, ticket)) return;
         if (!isRecord(response)) return;
+        if (overtakenByPendingWithdrawal(key, response, ticket)) return;
         const content = response.content;
         if (!isRecord(content)) return;
         const {
@@ -938,6 +1063,13 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
     const file = assemblyFile(key);
     const clock = { ...record.clock, observedAt: Math.max(record.clock.observedAt, nowEstimate()) };
     writeFileAtomically(file, JSON.stringify({ ...record, clock }));
+    refusedFiles.delete(file);
+    refusedScopes.get(key.scope)?.add(file);
+    for (const withdrawal of pendingWithdrawals.values()) {
+      if (withdrawal.scope === key.scope && withdrawal.placementKey === key.placementKey)
+        withdrawal.renewed.add(file);
+    }
+    retryRefusals(key.scope);
     marks.set(file, { wall: clock.observedAt, at: performance.now() });
     armExpiryForFresh(file, record.schedule, Math.max(0, nowEstimate() - clock.fetchedAt));
   }
