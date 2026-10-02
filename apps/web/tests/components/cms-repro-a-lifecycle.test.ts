@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
-// Ticket acceptance probes against main. Intentionally failing assertions are
-// expected product behavior from OPEND-3436, not snapshots of today's defects.
+// Ticket acceptance probes. The 2026-10-02 product ruling keeps normal 30s
+// renewal, 5-minute production fallback probes, and Test's short authorization
+// deadline. Historical failures against the prior expectations remain in evidence.
 import { createElement } from "react";
 import path from "node:path";
 import ts from "typescript";
@@ -137,19 +138,27 @@ describe("OPEND-3363/3374/3376/3377/3378 acceptance gaps", () => {
 });
 
 describe("OPEND-3436 missing offline acceptance", () => {
-  it("AC3/8 temporary 5xx fallback never restarts periodic requests", async () => {
+  it("AC3/8 temporary 5xx fallback probes every five minutes instead of every thirty seconds", async () => {
     const load = vi.fn<Load>().mockResolvedValueOnce(grant()).mockRejectedValue(new ProductionTouchpointLoadError("http_503"));
     renderHook(() => useTouchpointLifecycle({ enabled: true, identity: "A", load, offlineFallback: true }));
     await step(30_000); expect(load).toHaveBeenCalledTimes(2);
-    await step(SERVER_FAULT_HEARTBEAT_MS * 2);
+    await step(SERVER_FAULT_HEARTBEAT_MS - 1);
     expect(load).toHaveBeenCalledTimes(2);
+    await step(1); expect(load).toHaveBeenCalledTimes(3);
+    await step(SERVER_FAULT_HEARTBEAT_MS); expect(load).toHaveBeenCalledTimes(4);
   });
-  it("AC3/8 a cached daemon answer after DNS failure stops all automatic retries", async () => {
+  it("AC3/8 a cached daemon answer after DNS failure probes every five minutes and returns to normal renewal on recovery", async () => {
     const load = vi.fn<Load>().mockResolvedValue({ ...grant(), offlineRecovery: "unannounced" } as TouchpointLifecycleLoad<Value>);
     renderHook(() => useTouchpointLifecycle({ enabled: true, identity: "A", load, offlineFallback: true }));
     await step(); expect(load).toHaveBeenCalledTimes(1);
-    await step(SERVER_FAULT_HEARTBEAT_MS * 2);
+    await step(SERVER_FAULT_HEARTBEAT_MS - 1);
     expect(load).toHaveBeenCalledTimes(1);
+    await step(1); expect(load).toHaveBeenCalledTimes(2);
+    await step(SERVER_FAULT_HEARTBEAT_MS); expect(load).toHaveBeenCalledTimes(3);
+    load.mockResolvedValue(grant());
+    wake("focus"); await step(); expect(load).toHaveBeenCalledTimes(4);
+    await step(29_999); expect(load).toHaveBeenCalledTimes(4);
+    await step(1); expect(load).toHaveBeenCalledTimes(5);
   });
   it("AC3 known offline focus must not send another request", async () => {
     const load = vi.fn<Load>().mockResolvedValueOnce(grant()).mockRejectedValue(new ProductionTouchpointLoadError("network"));
@@ -279,41 +288,66 @@ describe("production component acceptance", () => {
 describe("OPEND-3436 Test channel", () => {
   function setupTest() {
     let failed = false;
+    let recovered = false;
     const fetchMock = vi.fn(async (url: string) => {
       if (failed) throw new TypeError("DNS unavailable");
       const context = { deploymentId: "deployment-1", scenario: "realtime", updatedAt: at(0), scheduleState: "active" };
       if (String(url).includes("deployments")) return json({ deployments: [{ id: "deployment-1", activityId: "activity-1", snapshotHash: "sha256:snapshot", snapshot: { contentVersionId: "version-1", manifestHash: "sha256:manifest", artifactHash: "sha256:artifact", placementKeys: placements } }] });
       if (String(url).includes("context")) return json(context);
       const placement = new URL(String(url), "http://localhost").searchParams.get("placementKey")!;
-      return json({ ...decision(placement), authorizationExpiresAt: at(60_000), testContext: context });
+      return json({
+        ...decision(placement),
+        serverTime: recovered ? new Date(Date.now()).toISOString() : at(0),
+        authorizationExpiresAt: recovered ? new Date(Date.now() + 60_000).toISOString() : at(60_000),
+        testContext: context,
+      });
     });
     vi.stubGlobal("fetch", fetchMock);
     const view = render(createElement(TestCampaignModal, { authenticated: true, sessionSubject: "A" }));
     const probe = renderHook(() => useTestRuntime());
-    return { fetchMock, probe, fail: () => { failed = true; }, restart: () => {
+    return { fetchMock, probe, fail: () => { failed = true; }, recover: () => { failed = false; recovered = true; }, restart: () => {
       view.unmount();
       render(createElement(TestCampaignModal, { authenticated: true, sessionSubject: "A" }));
     } };
   }
-  it("AC2/10 Test retains all four decisions beyond the short authorization offline", async () => {
-    const { probe, fail } = setupTest(); await step();
+  // Product ruling, 2026-10-02: Test does not extend offline authority to
+  // activity endsAt. Keep the old failure evidence; assert the approved rule.
+  it("AC2/10 Test hides all four decisions at the short authorization deadline offline and revalidates on recovery", async () => {
+    const { probe, fail, recover } = setupTest(); await step();
     expect(probe.result.current?.decisions.size).toBe(4);
-    fail(); await step(120_000);
+    fail(); await step(59_999);
+    expect(probe.result.current?.decisions.size).toBe(4);
+    expect(probe.result.current?.isAuthorized()).toBe(true);
+    await step(1);
+    expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+    expect(probe.result.current?.isAuthorized() ?? false).toBe(false);
+    await step(60_000);
+    expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+    recover(); wake("online"); await step();
     expect(probe.result.current?.decisions.size).toBe(4);
     expect(probe.result.current?.isAuthorized()).toBe(true);
   });
-  it("AC3/10 Test directory and decision requests stop after first failure", async () => {
-    const { fetchMock, probe, fail } = setupTest(); await step();
+  it("AC3/10 Test continues normal rechecks after failure without extending expired display authority", async () => {
+    const { fetchMock, probe, fail, recover } = setupTest(); await step();
     expect(probe.result.current?.decisions.size).toBe(4);
     fail(); await step(30_000);
     const calls = fetchMock.mock.calls.length;
     await step(120_000);
-    expect(fetchMock.mock.calls.length).toBe(calls);
-  });
-  it("AC4/10 Test restores the same account's four cached decisions after offline remount", async () => {
-    const { probe, fail, restart } = setupTest(); await step();
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(calls);
+    expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+    expect(probe.result.current?.isAuthorized() ?? false).toBe(false);
+    recover(); wake("online"); await step();
     expect(probe.result.current?.decisions.size).toBe(4);
-    fail(); restart(); await step();
-    expect(probe.result.current?.decisions.size ?? 0).toBe(4);
+    expect(probe.result.current?.isAuthorized()).toBe(true);
+  });
+  it("AC4/10 Test does not restore expired offline grants on remount and requires a fresh server answer", async () => {
+    const { probe, fail, restart, recover } = setupTest(); await step();
+    expect(probe.result.current?.decisions.size).toBe(4);
+    fail(); await step(60_000); restart(); await step();
+    expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+    expect(probe.result.current?.isAuthorized() ?? false).toBe(false);
+    recover(); wake("online"); await step();
+    expect(probe.result.current?.decisions.size).toBe(4);
+    expect(probe.result.current?.isAuthorized()).toBe(true);
   });
 });
