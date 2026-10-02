@@ -520,3 +520,106 @@ describe('delivery receipt fence recovery', () => {
     expect(cache.replayOffline(key, 'upstream_unavailable')).toBeNull();
   });
 });
+
+
+describe('bounded revocation eviction with real request ordering', () => {
+  const receiptFor = (grant: ReturnType<typeof full>) => ({ error: 'production_runtime_revoked', receipt: {
+    activityId: grant.activityId, deploymentId: grant.deploymentId,
+    contentVersionId: grant.content.id, touchpointDecisionId: grant.touchpointDecisionId,
+  } });
+  it.each(['precise', 'unqualified', 'account'] as const)('does not resurrect an old response after %s fence eviction', kind => {
+    const cache = createTouchpointContentCache(dataDir);
+    const alias = { ...key, locale: 'zh-TW' };
+    const grant = full({ serverTime: 0, endsAt: HOUR });
+    // Match the proxy: held (including refusal recovery), ticket, delayed response.
+    cache.remember(key, { ...grant, deploymentId: 'other-delivery' });
+    expect(cache.held(alias)).toBeNull();
+    const old = cache.ticket(alias);
+    if (kind === 'account') cache.refuseScope(key.scope);
+    else cache.forgetWithdrawn(key, kind === 'precise' ? receiptFor(grant) : null);
+    for (let i = 0; i < 257; i++) {
+      const filler = { ...key, scope: `production:filler-${i}`, placementKey: `placement-${i}` };
+      cache.remember(filler, { ...grant, placementKey: filler.placementKey,
+        deploymentId: `filler-${i}`, content: { ...grant.content, placementKey: filler.placementKey } });
+      if (kind === 'account') cache.refuseScope(filler.scope);
+      else cache.forgetWithdrawn(filler, kind === 'precise' ? receiptFor({ ...grant, deploymentId: `filler-${i}` }) : null);
+    }
+    cache.remember(alias, grant, old);
+    expect(cache.replayOffline(alias, 'upstream_unavailable')).toBeNull();
+    cache.held(alias);
+    cache.remember(alias, full({ serverTime: 1_000, endsAt: HOUR }), cache.ticket(alias));
+    expect(cache.replayOffline(alias, 'upstream_unavailable')).not.toBeNull();
+  });
+  it('does not adopt a late trimmed grant after receipt eviction', () => {
+    const cache = createTouchpointContentCache(dataDir);
+    const alias = { ...key, locale: 'zh-TW' };
+    const grant = full({ serverTime: 0, endsAt: HOUR });
+    cache.remember(alias, { ...grant, deploymentId: 'other-delivery' });
+    const held = cache.held(alias)!; const old = cache.ticket(alias);
+    cache.held(key); const withdrawal = cache.ticket(key);
+    cache.forgetWithdrawn(key, receiptFor(grant)); cache.finishTicket(withdrawal);
+    for (let i = 0; i < 257; i++) cache.forgetWithdrawn({ ...key, placementKey: `filler-${i}` },
+      receiptFor({ ...grant, deploymentId: `filler-${i}` }));
+    expect(cache.reassemble(alias, held, trimmed({ serverTime: 1_000, endsAt: HOUR }), old)?.deploymentId).toBe('deployment-1');
+    expect(cache.replayOffline(alias, 'upstream_unavailable')?.deploymentId).toBe('other-delivery');
+  });
+  it('keeps precise scope after eviction for a different late delivery and another account', () => {
+    const cache = createTouchpointContentCache(dataDir);
+    const alias = { ...key, locale: 'zh-TW' };
+    const account = { ...key, scope: 'production:B' };
+    cache.held(alias); const other = cache.ticket(alias);
+    cache.held(account); const accountTicket = cache.ticket(account);
+    cache.remember(key, full({ serverTime: 0, endsAt: HOUR }));
+    cache.forgetWithdrawn(key, receiptFor(full({ serverTime: 0, endsAt: HOUR })));
+    for (let i = 0; i < 257; i++) cache.forgetWithdrawn({ ...key, placementKey: `filler-${i}` },
+      receiptFor({ ...full({ serverTime: 0, endsAt: HOUR }), deploymentId: `filler-${i}` }));
+    cache.remember(alias, { ...full({ serverTime: 1_000, endsAt: HOUR }), deploymentId: 'other-delivery' }, other);
+    cache.remember(account, full({ serverTime: 1_000, endsAt: HOUR }), accountTicket);
+    expect(cache.replayOffline(alias, 'upstream_unavailable')?.deploymentId).toBe('other-delivery');
+    expect(cache.replayOffline(account, 'upstream_unavailable')?.deploymentId).toBe('deployment-1');
+  });
+});
+
+
+describe('bounded request authority lifetime', () => {
+  it.each(['release', 'expire'] as const)('recovers cache capacity after request %s', mode => {
+    const cache = createTouchpointContentCache(dataDir);
+    const tickets = Array.from({ length: 256 }, () => { cache.held(key); return cache.ticket(key); });
+    cache.held(key);
+    const saturated = cache.ticket(key);
+    cache.remember(key, full({ serverTime: 0, endsAt: HOUR }), saturated);
+    expect(cache.held(key)).toBeNull();
+    if (mode === 'release') cache.finishTicket(tickets[0]!);
+    else vi.advanceTimersByTime(10_000);
+    cache.held(key);
+    cache.remember(key, full({ serverTime: 10_000, endsAt: HOUR }), cache.ticket(key));
+    expect(cache.replayOffline(key, 'upstream_unavailable')).not.toBeNull();
+    // A released/expired request never gains authority back through a later grant.
+    cache.remember(key, { ...full({ serverTime: 20_000, endsAt: HOUR }), deploymentId: 'late' }, tickets[0]);
+    expect(cache.replayOffline(key, 'upstream_unavailable')?.deploymentId).toBe('deployment-1');
+  });
+  it('caps exact receipts per active request and allows a new grant after saturation', () => {
+    const cache = createTouchpointContentCache(dataDir);
+    cache.held(key); const old = cache.ticket(key);
+    for (let i = 0; i < 257; i++) cache.forgetWithdrawn(key, { error: 'production_runtime_revoked', receipt: {
+      activityId: 'activity-1', deploymentId: `delivery-${i}`, contentVersionId: 'version-1', touchpointDecisionId: 'decision-1',
+    } });
+    // Normal receipt precision is retained by earlier tests; saturated tracking declines all persistence.
+    cache.remember(key, full({ serverTime: 0, endsAt: HOUR }), old);
+    expect(cache.held(key)).toBeNull();
+    cache.finishTicket(old);
+    cache.held(key); const fresh = cache.ticket(key);
+    cache.remember(key, full({ serverTime: 1_000, endsAt: HOUR }), fresh);
+    expect(cache.replayOffline(key, 'upstream_unavailable')).not.toBeNull();
+  });
+  it('declines persistence at the exact ten-second request boundary', () => {
+    const cache = createTouchpointContentCache(dataDir);
+    cache.held(key); const ticket = cache.ticket(key);
+    vi.advanceTimersByTime(9_999);
+    cache.remember(key, full({ serverTime: 0, endsAt: HOUR }), ticket);
+    expect(cache.held(key)).not.toBeNull();
+    vi.advanceTimersByTime(1);
+    cache.remember(key, { ...full({ serverTime: 1_000, endsAt: HOUR }), deploymentId: 'late' }, ticket);
+    expect(cache.replayOffline(key, 'upstream_unavailable')?.deploymentId).toBe('deployment-1');
+  });
+});

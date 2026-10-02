@@ -1003,6 +1003,7 @@ function proxyTouchpointRuntimeRequest(
       });
     });
     currentUpstream = upstream;
+    if (ticket !== undefined) upstream.once('close', () => contentCache?.finishTicket(ticket));
     upstream.setTimeout(30_000, () =>
       upstream.destroy(new Error('Touchpoint runtime request timed out')),
     );

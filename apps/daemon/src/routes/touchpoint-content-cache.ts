@@ -108,6 +108,8 @@ export interface TouchpointContentCache {
    * Such answers are still served; only persisting their authority is refused.
    */
   ticket(key: TouchpointContentKey): number;
+  /** Release the request-local fence when the upstream attempt closes. */
+  finishTicket(ticket: number): void;
   /**
    * The whole decision to answer with while the runtime is unreachable, or
    * `null` when there is nothing this store may put on the screen.
@@ -257,6 +259,8 @@ const envelopeOf = (response: Record<string, unknown>): Record<string, unknown> 
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 /** Upper bound on remembered withdrawals; see the revocation barrier. */
 const MAX_REVOCATIONS = 256;
+/** Same authority lifetime as the production proxy decision budget. */
+const REQUEST_AUTHORITY_MS = 10_000;
 
 export function createTouchpointContentCache(runtimeDataDir: string): TouchpointContentCache {
   // Derived from the daemon's resolved data root (AGENTS.md "Daemon data
@@ -625,6 +629,39 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
   const replayPauses = new Map<string, number>();
   /** Per placement: the last ticket issued, and the last one a 410 overtook. */
   let tickets = 0;
+  // Global history may evict a withdrawal while an older request is still in
+  // flight. Keep that request's exact receipts until completion, independently
+  // of history eviction. Capacity/expiry costs caching only, never the online
+  // answer. Each dimension is bounded; a saturated request cannot persist.
+  const activeTickets = new Map<number, {
+    key: TouchpointContentKey; expiresAt: number; refused: boolean; receipts: Set<string>;
+  }>();
+  const pruneTickets = (): void => {
+    const now = performance.now();
+    for (const [ticket, active] of activeTickets)
+      if (active.expiresAt <= now) activeTickets.delete(ticket);
+  };
+  const fenceActive = (scope: string, key?: TouchpointContentKey, receipt?: TouchpointCachedIdentity): void => {
+    pruneTickets();
+    for (const active of activeTickets.values()) {
+      if (active.key.scope !== scope || (key && active.key.placementKey !== key.placementKey)) continue;
+      if (key && !receipt && active.key.locale !== key.locale) continue;
+      if (!receipt) active.refused = true;
+      else {
+        const name = deliveryName(scope, receipt);
+        if (!active.receipts.has(name) && active.receipts.size >= MAX_REVOCATIONS) active.refused = true;
+        else active.receipts.add(name);
+      }
+    }
+  };
+  const requestCannotPersist = (key: TouchpointContentKey, response: unknown, ticket: number | undefined): boolean => {
+    if (ticket === undefined) return false;
+    const active = activeTickets.get(ticket);
+    if (!active || active.expiresAt <= performance.now() || active.refused ||
+      active.key.scope !== key.scope || active.key.placementKey !== key.placementKey || active.key.locale !== key.locale) return true;
+    const identity = touchpointCachedIdentityOf(response);
+    return identity !== null && active.receipts.has(deliveryName(key.scope, identity));
+  };
   const withdrawnThrough = new Map<string, number>();
   const fenceInFlight = (key: TouchpointContentKey): void => {
     const name = `${key.scope}\u0000${keyName(key)}`;
@@ -840,14 +877,20 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
       const record = readAssembly(key);
       if (!record || !recordStillHolds(record, held)) return null;
       const full = rebuild(key, record, trimmed);
-      if (full && !overtakenByWithdrawal(key, ticket) && !overtakenByPendingWithdrawal(key, full, ticket) && !overtakenByReceipt(key, full, ticket))
+      if (full && !requestCannotPersist(key, full, ticket) && !overtakenByWithdrawal(key, ticket) && !overtakenByPendingWithdrawal(key, full, ticket) && !overtakenByReceipt(key, full, ticket))
         adoptRenewal(key, record, full, trimmed, clock);
       return full;
     },
 
-    ticket() {
-      return ++tickets;
+    ticket(key) {
+      pruneTickets();
+      const ticket = ++tickets;
+      if (activeTickets.size < MAX_REVOCATIONS) activeTickets.set(ticket, {
+        key: { ...key }, expiresAt: performance.now() + REQUEST_AUTHORITY_MS, refused: false, receipts: new Set(),
+      });
+      return ticket;
     },
+    finishTicket(ticket) { activeTickets.delete(ticket); },
 
     replayOffline(key, reason) {
       retryRefusals(key.scope);
@@ -888,6 +931,12 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
 
     forgetWithdrawn(key, body) {
       const receipt = touchpointRevocationReceiptOf(body);
+      if (receipt) fenceActive(key.scope, key, receipt);
+      else {
+        // An unqualified 410 reaches every requested locale for this placement.
+        for (const active of activeTickets.values())
+          if (active.key.scope === key.scope && active.key.placementKey === key.placementKey) active.refused = true;
+      }
       // An unqualified withdrawal applies to this placement in every requested
       // language. A receipt names a delivery, including its other cached locales.
       if (!receipt) fenceGroup(placementFenceName(key));
@@ -952,7 +1001,7 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
     remember(key, response, ticket, requestElapsedMs = 0) {
       try {
         const clock = responseClock(requestElapsedMs);
-        if (overtakenByWithdrawal(key, ticket)) return;
+        if (requestCannotPersist(key, response, ticket) || overtakenByWithdrawal(key, ticket)) return;
         if (!isRecord(response)) return;
         if (overtakenByPendingWithdrawal(key, response, ticket) || overtakenByReceipt(key, response, ticket)) return;
         const content = response.content;
@@ -1061,6 +1110,7 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
   };
 
   function refuseAuthority(scope: string, key?: TouchpointContentKey): void {
+    fenceActive(scope, key);
     if (key !== undefined) {
       fenceInFlight(key);
       refusedFiles.add(assemblyFile(key));
