@@ -25,9 +25,12 @@ import {
 	recordVisibleTestTouchpoint,
 	setTestRuntimeSession,
 	clearTestRuntimeSession,
+	useTestRuntime,
+	dispatchTestCampaignAction,
 	type TestDecision,
 	type TestRuntimeSession,
 } from "../../src/components/TestCampaignModal";
+import * as campaignNavigation from "../../src/components/touchpoint-navigation";
 import * as touchpointComponent from "../../src/components/touchpoint-component";
 import { OpenDesignTouchpointElement } from "../../src/components/touchpoint-component";
 
@@ -173,6 +176,101 @@ describe("Test decisions at the existing host touchpoints", () => {
 		vi.unstubAllEnvs();
 		vi.restoreAllMocks();
 		delete (globalThis as HostGlobal).__cmsTestHost;
+	});
+
+
+	it.each([401, 403, 410, 503])("runtime %s controls all mounted Test authority while catalog is stalled", async (status) => {
+		vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+		vi.setSystemTime(new Date(context.updatedAt));
+		vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+		const activationDescriptor = Object.getOwnPropertyDescriptor(navigator, "userActivation");
+		Object.defineProperty(navigator, "userActivation", { configurable: true, value: { isActive: true } });
+		const navigate = vi.spyOn(campaignNavigation, "navigateCampaignTarget").mockResolvedValue(true);
+		const deployment = {
+			id: context.deploymentId, activityId: "activity-four", snapshotHash: "sha256:four-snapshot",
+			snapshot: { contentVersionId: "version-four-placement", manifestHash: "sha256:four-manifest", artifactHash: "sha256:four-artifact", placementKeys: [...placements] },
+		};
+		const actions = [{ id: "plan", target: { kind: "https" as const, url: "https://example.com" } }];
+		let renewed = false;
+		const siblings: AbortSignal[] = [];
+		const receipts: AbortSignal[] = [];
+		const catalogs: AbortSignal[] = [];
+		const stalled = (signal: AbortSignal, signals: AbortSignal[]) => new Promise<Response>((_resolve, reject) => {
+			signals.push(signal);
+			signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+		});
+		const fetchMock = vi.fn(async (input: string, init?: RequestInit) => {
+			const url = new URL(input, "http://localhost");
+			if (url.pathname.endsWith("/deployments")) return renewed ? stalled(init!.signal!, catalogs) : Response.json({ deployments: [deployment] });
+			if (url.pathname.endsWith("/context")) return Response.json(context);
+			if (url.pathname.includes("acceptances")) return stalled(init!.signal!, receipts);
+			if (url.pathname === "/api/touchpoints/test-runtime") {
+				const placement = placements.find((key) => key === url.searchParams.get("placementKey"))!;
+				if (renewed) {
+					if (status === 503 || placement === "opend.home.campaign-modal") return Response.json({}, { status });
+					return stalled(init!.signal!, siblings);
+				}
+				const value = decision(placement);
+				return Response.json({ ...value, staticActions: actions, content: {
+					...value.content, manifest: { ...manifest, placements: manifest.placements.map((p) => ({ ...p, staticActions: actions })) },
+				} });
+			}
+			return Response.json({}, { status: 404 });
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		let current: TestRuntimeSession | null = null;
+		function Probe() { current = useTestRuntime(); return null; }
+		const tick = async (ms: number) => { await act(async () => { await vi.advanceTimersByTimeAsync(ms); }); };
+		const nodes = () => document.querySelectorAll("opend-touchpoint");
+		try {
+			render(<I18nProvider initial="zh-CN"><Probe />
+				<TestCampaignModal authenticated sessionSubject="account-a" />
+				<ProductionCampaignModal authenticated sessionSubject="account-a" />
+				<ProductionCampaignBadge authenticated sessionSubject="account-a" />
+				<ProductionCampaignHover authenticated sessionSubject="account-a" />
+			</I18nProvider>);
+			await tick(0);
+			expect(nodes()).toHaveLength(4);
+			const previous = current! as TestRuntimeSession;
+			expect(previous.decisions.size).toBe(4);
+			const oldDecision = previous.decisions.get("opend.home.campaign-modal")!;
+			await expect(dispatchTestCampaignAction(oldDecision, "plan")).resolves.toBe(true);
+			expect(navigate).toHaveBeenCalledTimes(1);
+			await tick(29_999);
+			expect(receipts.some((signal) => !signal.aborted)).toBe(true);
+			expect(previous.isAuthorized("opend.home.campaign-modal")).toBe(true);
+			renewed = true;
+			await tick(1); // The normal 30-second renewal; the old grant still has 30 seconds.
+			expect(catalogs).toHaveLength(1);
+			expect(catalogs[0]!.aborted).toBe(false);
+			if (status === 503) {
+				expect(nodes()).toHaveLength(4);
+				expect((current! as TestRuntimeSession).decisions.size).toBe(4);
+				expect(previous.isAuthorized("opend.home.campaign-modal")).toBe(true);
+				await tick(29_999);
+				expect(nodes()).toHaveLength(4);
+				await tick(1);
+			}
+			expect(nodes()).toHaveLength(0);
+			if (status !== 503) {
+				expect(siblings).toHaveLength(3);
+				expect(siblings.every((signal) => signal.aborted)).toBe(true);
+			}
+			expect(current === null || (current as TestRuntimeSession).decisions.size === 0).toBe(true);
+			for (const placement of placements) expect(previous.isAuthorized(placement)).toBe(false);
+			await expect(dispatchTestCampaignAction(oldDecision, "plan")).resolves.toBe(false);
+			expect(navigate).toHaveBeenCalledTimes(1);
+			expect(receipts.every((signal) => signal.aborted)).toBe(true);
+			const sent = receipts.length;
+			recordVisibleTestTouchpoint(previous, oldDecision, "opend.home.campaign-modal");
+			await tick(1_000);
+			expect(receipts).toHaveLength(sent); // Stale visibility and queued receipt retries lost authority.
+		} finally {
+			cleanup();
+			vi.useRealTimers();
+			if (activationDescriptor) Object.defineProperty(navigator, "userActivation", activationDescriptor);
+			else Reflect.deleteProperty(navigator, "userActivation");
+		}
 	});
 
 	it("discovers new Test deployments without reload, preserves unchanged mounts and follows replacement/removal after end", async () => {

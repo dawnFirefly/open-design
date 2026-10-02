@@ -1,15 +1,12 @@
 import {
 	touchpointOfflineReplayOf,
+	touchpointRevocationReceiptOf,
+	type TouchpointRevocationReceipt,
 	type TouchpointOfflineReplay,
 } from "@open-design/contracts/api/touchpointOffline";
 import type { TouchpointOfflineRecovery } from "./touchpoint-lifecycle";
 
-export type ProductionRuntimeRevocationReceipt = Readonly<{
-	touchpointDecisionId: string;
-	deploymentId: string;
-	activityId: string;
-	contentVersionId: string;
-}>;
+export type ProductionRuntimeRevocationReceipt = TouchpointRevocationReceipt;
 export type ProductionTouchpointLoadResult =
 	/**
 	 * `offlineReplay` is the daemon's own marker, carried up whole rather than
@@ -85,12 +82,6 @@ export class ProductionTouchpointLoadError extends Error {
 	}
 }
 
-function receipt(value: unknown): ProductionRuntimeRevocationReceipt | null {
-	if (!value || typeof value !== "object") return null;
-	const candidate = value as Partial<ProductionRuntimeRevocationReceipt>;
-	return typeof candidate.touchpointDecisionId === "string" && typeof candidate.deploymentId === "string" && typeof candidate.activityId === "string" && typeof candidate.contentVersionId === "string" ? candidate as ProductionRuntimeRevocationReceipt : null;
-}
-
 /** Loads a production decision; only a server-authenticated 410 receipt revokes an active lease. */
 export async function loadProductionTouchpointDecision(placementKey: string, locale: string, signal: AbortSignal, activeDecisionId?: string): Promise<ProductionTouchpointLoadResult> {
 	let response: Response;
@@ -105,8 +96,7 @@ export async function loadProductionTouchpointDecision(placementKey: string, loc
 	if (response.status === 404) return { kind: "no-decision" };
 	if (response.status === 410) {
 		try {
-			const body = await response.json() as { error?: unknown; receipt?: unknown };
-			const parsed = body.error === "production_runtime_revoked" ? receipt(body.receipt) : null;
+			const parsed = touchpointRevocationReceiptOf(await response.json());
 			if (!parsed) throw new ProductionTouchpointLoadError("http_410");
 			return { kind: "revoked", receipt: parsed };
 		} catch (error) {

@@ -111,6 +111,7 @@ export function setTestRuntimeSession(
 	session: TestRuntimeSession | null,
 ): void {
 	if (
+		!session?.decisions.size ||
 		currentTestSession?.selectionKey !== session?.selectionKey ||
 		currentTestSession?.context.testerMemberId !==
 			session?.context.testerMemberId ||
@@ -156,15 +157,16 @@ class StaleTestContextError extends Error {
 }
 
 /**
- * A Test runtime refusal. A 410 is the server withdrawing the deployment, so
- * it carries the same `touchpointWithdrawal` mark as Production and ends a
- * lease that is already on screen instead of waiting for it to lapse.
+ * A Test runtime refusal ends the selected campaign's display authority.
+ * Authentication/authorization refusal and deployment withdrawal cancel the
+ * whole attempt immediately, even while a sibling or catalog request hangs.
+ * Transport failures keep only the original short Test lease.
  */
 class TestRuntimeResponseError extends Error {
 	readonly touchpointWithdrawal: boolean;
 	constructor(code: string, status: number) {
 		super(code);
-		this.touchpointWithdrawal = status === 410;
+		this.touchpointWithdrawal = status === 401 || status === 403 || status === 410;
 	}
 }
 
