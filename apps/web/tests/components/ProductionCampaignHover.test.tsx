@@ -656,6 +656,9 @@ describe("ProductionCampaignHover", () => {
 		);
 
 	it.each([
+		["entry revoked while layer unavailable", "match", "transient", true],
+		["layer revoked while entry unavailable", "transient", "match", true],
+		["unrelated receipt while layer unavailable", "mismatch", "transient", false],
 		["entry mismatch and layer match", "mismatch", "match", true],
 		["entry match and layer mismatch", "match", "mismatch", true],
 		["both mismatched", "mismatch", "mismatch", false],
@@ -672,11 +675,13 @@ describe("ProductionCampaignHover", () => {
 			const entry = decision("opend.home.hover-entry");
 			const layer = decision("opend.home.hover-layer");
 			const receiptFor = (
-				result: "match" | "mismatch" | "layer",
+				result: "match" | "mismatch" | "layer" | "transient",
 				value: typeof entry,
 				other: typeof layer,
 			) =>
-				result === "match"
+				result === "transient"
+					? new Response(JSON.stringify({ error: "upstream_unavailable" }), { status: 502 })
+					: result === "match"
 					? revocation(value)
 					: result === "layer"
 						? revocation(other)

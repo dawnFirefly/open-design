@@ -73,6 +73,62 @@ afterEach(() => {
 });
 
 describe('touchpoint content cache answer ordering', () => {
+  it('requires a fresh grant after refusal, including a trimmed renewal', () => {
+    const cache = createTouchpointContentCache(dataDir);
+    cache.remember(key, full({ serverTime: 0, endsAt: HOUR }));
+    const held = cache.held(key)!;
+    cache.refuseReplay(key, 401);
+    expect(cache.held(key)).toEqual(held); // Byte reuse is still possible.
+    expect(replayAfterRestart()).toBeNull();
+    vi.advanceTimersByTime(1_000);
+    const grant = trimmed({ serverTime: 1_000, endsAt: HOUR });
+    expect(cache.reassemble(key, held, grant, cache.ticket(key))).not.toBeNull();
+    expect(replayAfterRestart()).not.toBeNull();
+  });
+
+  it.each([401, 403, 404] as const)('fences a late full or trimmed grant after %s', status => {
+    const cache = createTouchpointContentCache(dataDir);
+    cache.remember(key, full({ serverTime: 0, endsAt: HOUR }));
+    const held = cache.held(key)!;
+    const lateTicket = cache.ticket(key);
+    cache.refuseReplay(key, status);
+    cache.remember(key, full({ serverTime: 0, endsAt: HOUR }), lateTicket);
+    cache.reassemble(key, held, trimmed({ serverTime: 0, endsAt: HOUR }), lateTicket);
+    expect(replayAfterRestart()).toBeNull();
+  });
+
+  it('isolates refusal by account and environment, and rejects all grants of the refused account', () => {
+    const cache = createTouchpointContentCache(dataDir);
+    const otherAccount = { ...key, scope: 'production:B' };
+    const otherEnvironment = { ...key, scope: 'test:A' };
+    const otherLocale = { ...key, locale: 'zh-TW' };
+    for (const candidate of [key, otherAccount, otherEnvironment, otherLocale])
+      cache.remember(candidate, full({ serverTime: 0, endsAt: HOUR }));
+    cache.refuseReplay(key, 403);
+    const restarted = createTouchpointContentCache(dataDir);
+    for (const candidate of [key, otherLocale])
+      expect(restarted.replayOffline(candidate, 'upstream_unavailable')).toBeNull();
+    for (const candidate of [otherAccount, otherEnvironment])
+      expect(restarted.replayOffline(candidate, 'upstream_unavailable')).not.toBeNull();
+  });
+
+  it('withdraws fallback locale aliases but preserves unrelated deliveries', () => {
+    const cache = createTouchpointContentCache(dataDir);
+    const alias = { ...key, locale: 'zh-TW' };
+    const unrelated = { ...key, locale: 'ja-JP' };
+    cache.remember(key, full({ serverTime: 0, endsAt: HOUR }));
+    cache.remember(alias, full({ serverTime: 0, endsAt: HOUR }));
+    cache.remember(unrelated, { ...full({ serverTime: 0, endsAt: HOUR }), deploymentId: 'deployment-2' });
+    const lateTicket = cache.ticket(alias);
+    cache.forgetWithdrawn(key, { error: 'production_runtime_revoked', receipt: {
+      activityId: 'activity-1', deploymentId: 'deployment-1', contentVersionId: 'version-1', touchpointDecisionId: 'decision-1',
+    } });
+    cache.remember(alias, full({ serverTime: 1_000, endsAt: HOUR }), lateTicket);
+    const restarted = createTouchpointContentCache(dataDir);
+    expect(restarted.replayOffline(alias, 'upstream_unavailable')).toBeNull();
+    expect(restarted.replayOffline(unrelated, 'upstream_unavailable')).not.toBeNull();
+  });
+
   it('does not let an older full answer undo a newer early end', () => {
     const cache = createTouchpointContentCache(dataDir);
     vi.advanceTimersByTime(30_000);

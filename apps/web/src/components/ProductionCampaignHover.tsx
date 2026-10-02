@@ -22,6 +22,7 @@ import {
 	loadProductionTouchpointDecision,
 	productionTouchpointPairRecovery,
 	productionTouchpointRecovery,
+	ProductionTouchpointLoadError,
 } from "./production-touchpoint-loader";
 import {
 	resolveAuthorizationDeadline,
@@ -157,7 +158,7 @@ export function ProductionCampaignHover({
 			active: ActiveHover | null,
 		): Promise<TouchpointLifecycleLoad<ActiveHover>> => {
 			if (!locale || !sessionSubject) return { kind: "clear" };
-			const [entryLoaded, layerLoaded] = await Promise.all([
+			const [entryResult, layerResult] = await Promise.allSettled([
 				loadProductionTouchpointDecision(
 					ENTRY_PLACEMENT,
 					locale,
@@ -171,11 +172,20 @@ export function ProductionCampaignHover({
 					active?.layer.decision.touchpointDecisionId,
 				),
 			]);
+			// Inspect each authoritative answer before propagating the other
+			// placement's transport failure. A 502 must not swallow a paired 410.
+			const results = [entryResult, layerResult];
+			for (const result of results) {
+				if (result.status === "rejected" && result.reason instanceof ProductionTouchpointLoadError && result.reason.touchpointWithdrawal)
+					throw result.reason;
+			}
+			const entryLoaded = entryResult.status === "fulfilled" ? entryResult.value : null;
+			const layerLoaded = layerResult.status === "fulfilled" ? layerResult.value : null;
 			const matches = (
 				loaded: typeof entryLoaded,
 				decision: TouchpointLeaseValue<RuntimeDecision> | undefined,
 			) =>
-				loaded.kind === "revoked" &&
+				loaded?.kind === "revoked" &&
 				decision &&
 				loaded.receipt.touchpointDecisionId === decision.touchpointDecisionId &&
 				loaded.receipt.deploymentId === decision.deploymentId &&
@@ -186,6 +196,10 @@ export function ProductionCampaignHover({
 				matches(layerLoaded, active?.layer.decision)
 			)
 				return { kind: "clear" };
+			for (const result of results) {
+				if (result.status === "rejected") throw result.reason;
+			}
+			if (!entryLoaded || !layerLoaded) return { kind: "retain" };
 			if (entryLoaded.kind === "revoked" || layerLoaded.kind === "revoked")
 				return { kind: "retain" };
 			if (entryLoaded.kind === "no-decision" || layerLoaded.kind === "no-decision")

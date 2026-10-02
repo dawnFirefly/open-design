@@ -145,6 +145,7 @@ let baseUrl: string;
 let env: Record<string, string>;
 let reply: Reply;
 let upstreamCalls: number;
+let upstreamRequests: string[];
 /** Called once a `stall` reply has put its status and first bytes on the wire. */
 let onStalled: (() => void) | null;
 
@@ -163,10 +164,12 @@ const cutTheWire = async () => {
 beforeEach(async () => {
   dataDir = mkdtempSync(path.join(tmpdir(), 'od-touchpoint-offline-http-'));
   upstreamCalls = 0;
+  upstreamRequests = [];
   onStalled = null;
   reply = { status: 200, body: decision() };
   upstream = createServer((_req, res) => {
     upstreamCalls += 1;
+    upstreamRequests.push(_req.url ?? '');
     res.setHeader('content-type', 'application/json');
     res.statusCode = reply.status;
     // `padTo` grows the body past the proxy's buffering ceiling while keeping it
@@ -200,6 +203,10 @@ beforeEach(async () => {
   });
   upstreamPort = (await listen(upstream)).port;
   env = { VELA_CONTROL_KEY: 'ck-account-a', VELA_API_URL: `http://127.0.0.1:${upstreamPort}` };
+  await startDaemon();
+});
+
+const startDaemon = async () => {
   const app = express();
   app.use(express.json());
   registerVelaRoutes(app, {
@@ -210,7 +217,7 @@ beforeEach(async () => {
   });
   daemon = createServer(app);
   baseUrl = `http://127.0.0.1:${(await listen(daemon)).port}`;
-});
+};
 
 afterEach(async () => {
   vi.useRealTimers();
@@ -223,9 +230,11 @@ afterEach(async () => {
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-const decide = async () => {
+const decide = async (locale = LOCALE, activeDecisionId?: string) => {
+  const query = new URLSearchParams({ placementKey: PLACEMENT, locale });
+  if (activeDecisionId) query.set('activeDecisionId', activeDecisionId);
   const response = await fetch(
-    `${baseUrl}/api/touchpoints/production-runtime?placementKey=${PLACEMENT}&locale=${LOCALE}`,
+    `${baseUrl}/api/touchpoints/production-runtime?${query}`,
   );
   const text = await response.text();
   let body: any = null;
@@ -250,6 +259,19 @@ const storedRecords = (): string[] => {
 };
 
 describe('production touchpoint offline replay', () => {
+  it('carries the persisted decision into a cold recheck and respects the mounted caller credential', async () => {
+    await decide();
+    await close(daemon);
+    await startDaemon();
+    reply = { status: 410, body: { error: 'production_runtime_revoked', receipt: RECEIPT } };
+    expect((await decide()).status).toBe(410);
+    expect(upstreamRequests.at(-1)).toContain('activeDecisionId=decision-1');
+    reply = { status: 200, body: decision() };
+    await decide();
+    await decide(LOCALE, 'caller-mounted-decision');
+    expect(upstreamRequests.at(-1)).toContain('activeDecisionId=caller-mounted-decision');
+  });
+
   it.each(['full', 'trimmed'] as const)('does not re-grant a five-second window after a nine-second %s download', async kind => {
     let elapsed = 0;
     const realNow = performance.now.bind(performance);
@@ -322,7 +344,40 @@ describe('production touchpoint offline replay', () => {
     // Neither of those is a reason to throw the package away.
     expect(storedRecords()).toHaveLength(1);
     await cutTheWire();
-    expect((await decide()).body.offlineReplay?.reason).toBe('upstream_unreachable');
+    expect((await decide()).status).toBe(502);
+  });
+
+  it.each([401, 403, 404])('does not revive an earlier grant after %s then an outage or daemon restart', async (status) => {
+    await decide();
+    reply = { status, body: { error: 'decision_refused' } };
+    expect((await decide()).status).toBe(status);
+    expect(storedRecords()).toHaveLength(1); // Keep bytes; retire only display authority.
+    reply = { status: 503, body: { error: 'upstream_down' } };
+    expect((await decide()).status).toBe(503);
+    const { createTouchpointContentCache } = await import('../src/routes/touchpoint-content-cache.js');
+    // The route's opaque scope is persisted in its record; a fresh store must
+    // not forget the refusal when the process holding its timers goes away.
+    const record = JSON.parse(fs.readFileSync(storedRecords()[0]!, 'utf8'));
+    const restarted = createTouchpointContentCache(dataDir);
+    expect(restarted.replayOffline({ scope: record.scope, placementKey: PLACEMENT, locale: LOCALE }, 'upstream_unavailable')).toBeNull();
+    reply = { status: 200, body: decision() };
+    expect((await decide()).status).toBe(200);
+    reply = { status: 503, body: { error: 'upstream_down' } };
+    expect((await decide()).status).toBe(200); // A fresh grant restores authority.
+  });
+
+  it('reclaims every cached locale of a matching withdrawn delivery', async () => {
+    await decide();
+    const translated = decision();
+    translated.content.locale = 'zh-TW';
+    reply = { status: 200, body: translated };
+    await decide('zh-TW');
+    expect(storedRecords()).toHaveLength(2);
+    reply = { status: 410, body: { error: 'production_runtime_revoked', receipt: RECEIPT } };
+    expect((await decide()).status).toBe(410);
+    expect(storedRecords()).toHaveLength(0);
+    reply = { status: 503, body: { error: 'upstream_down' } };
+    expect((await decide('zh-TW')).status).toBe(503);
   });
 
   it('deletes the package a matching withdrawal names, and does not resurrect it offline', async () => {

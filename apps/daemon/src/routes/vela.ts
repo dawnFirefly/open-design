@@ -714,6 +714,10 @@ function proxyTouchpointRuntimeRequest(
   const send = (held: HeldContentRef | null, fallback: boolean): void => {
     const ticket = contentKey && contentCache ? contentCache.ticket(contentKey) : undefined;
     const attempt = new URL(target);
+    if (contentKey && contentCache && !attempt.searchParams.get('activeDecisionId')) {
+      const persistedDecisionId = contentCache.activeDecisionId(contentKey);
+      if (persistedDecisionId) attempt.searchParams.set('activeDecisionId', persistedDecisionId);
+    }
     if (held) {
       attempt.searchParams.set('heldContentId', held.heldContentId);
       attempt.searchParams.set('heldContentLocale', held.heldContentLocale);
@@ -749,6 +753,10 @@ function proxyTouchpointRuntimeRequest(
      * handlers ask this instead of assuming.
      */
     let upstreamStatus: number | null = null;
+    const refuseCachedAuthority = (status: number): void => {
+      if (contentKey && contentCache && (status === 401 || status === 403 || status === 404))
+        contentCache.refuseReplay(contentKey, status);
+    };
     let cutShortSettled = false;
     /**
      * Settles an attempt whose body ended in an error — the decision budget,
@@ -788,6 +796,9 @@ function proxyTouchpointRuntimeRequest(
     const requestElapsed = () => Math.max(0, performance.now() - requestStarted);
     const upstream = transport.request(attempt, { method: req.method, headers }, (upstreamRes) => {
       upstreamStatus = upstreamRes.statusCode ?? null;
+      // The status itself retires the old grant, even if the body is cut off,
+      // oversized, or unreadable. Keep bytes for a later authenticated renewal.
+      if (upstreamStatus !== null) refuseCachedAuthority(upstreamStatus);
       const passThrough = () => {
         res.status(upstreamRes.statusCode ?? 502);
         res.setHeader('content-type', upstreamRes.headers['content-type'] ?? 'application/json');

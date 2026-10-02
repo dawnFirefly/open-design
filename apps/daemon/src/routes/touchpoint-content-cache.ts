@@ -7,6 +7,7 @@ import {
   touchpointScheduleAllowsDisplay,
   touchpointScheduleHasEnded,
   touchpointScheduleOf,
+  touchpointRevocationReceiptOf,
   touchpointWithdrawalReclaims,
   TOUCHPOINT_OFFLINE_REPLAY_FIELD,
   type TouchpointCachedIdentity,
@@ -65,6 +66,8 @@ export type HeldContentRef = Readonly<{ heldContentId: string; heldContentLocale
 export interface TouchpointContentCache {
   /** The (id, locale) pair to offer upstream for this placement, if one is fully held. */
   held(key: TouchpointContentKey): HeldContentRef | null;
+  /** Persisted delivery credential for a cold recheck when no mounted caller supplies one. */
+  activeDecisionId(key: TouchpointContentKey): string | null;
   /**
    * Rebuild a `contentOmitted` response into a full one, or `null` when the
    * bytes for `held` are not available. `held` is the pair THIS attempt offered
@@ -125,6 +128,8 @@ export interface TouchpointContentCache {
    * `touchpointWithdrawalReclaims`.
    */
   forgetWithdrawn(key: TouchpointContentKey, body: unknown): boolean;
+  /** Retire display authority after authentication refusal or no decision; keep reusable bytes. */
+  refuseReplay(key: TouchpointContentKey, status: 401 | 403 | 404): void;
 }
 
 /**
@@ -186,6 +191,8 @@ type AssemblyRecord = Readonly<{
    * protocol after this code was written.
    */
   envelope: Record<string, unknown>;
+  /** A reachable refusal survives restart until a fresh full/trimmed grant replaces it. */
+  replayRefused?: boolean;
 }>;
 
 /**
@@ -587,8 +594,24 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
       withdrawnThrough.delete(oldest);
     }
   };
+  const scopeFenceName = (scope: string): string => `scope:${scope}`;
+  const placementFenceName = (key: TouchpointContentKey): string =>
+    `placement:${key.scope}\u0000${key.placementKey}`;
+  const fenceGroup = (name: string): void => {
+    withdrawnThrough.delete(name);
+    withdrawnThrough.set(name, tickets);
+    while (withdrawnThrough.size > MAX_REVOCATIONS) {
+      const oldest = withdrawnThrough.keys().next().value;
+      if (oldest === undefined) break;
+      withdrawnThrough.delete(oldest);
+    }
+  };
   const overtakenByWithdrawal = (key: TouchpointContentKey, ticket: number | undefined): boolean =>
-    ticket !== undefined && ticket <= (withdrawnThrough.get(`${key.scope}\u0000${keyName(key)}`) ?? 0);
+    ticket !== undefined && ticket <= Math.max(
+      withdrawnThrough.get(`${key.scope}\u0000${keyName(key)}`) ?? 0,
+      withdrawnThrough.get(scopeFenceName(key.scope)) ?? 0,
+      withdrawnThrough.get(placementFenceName(key)) ?? 0,
+    );
   const deliveryName = (scope: string, identity: TouchpointCachedIdentity): string =>
     [scope, identity.activityId, identity.deploymentId, identity.contentVersionId].join('\u0000');
   const recordRevocation = (record: AssemblyRecord): void => {
@@ -693,6 +716,11 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
   sweepExpired();
 
   return {
+    activeDecisionId(key) {
+      const id = readAssembly(key)?.identity?.touchpointDecisionId;
+      return typeof id === 'string' && id ? id : null;
+    },
+
     held(key) {
       const record = readAssembly(key);
       if (!record) return null;
@@ -724,7 +752,7 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
       const live = liveRecord(key);
       if (!live) return null;
       const { record, schedule, now } = live;
-      if (!record.identity || !touchpointScheduleAllowsDisplay(schedule, now)) return null;
+      if (record.replayRefused || !record.identity || !touchpointScheduleAllowsDisplay(schedule, now)) return null;
       const full = rebuild(key, record, record.envelope);
       if (!full) return null;
       const effectiveServerTime = new Date(now).toISOString();
@@ -743,11 +771,49 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
 
     forgetWithdrawn(key, body) {
       fenceInFlight(key);
-      const record = readAssembly(key);
-      if (!record || !touchpointWithdrawalReclaims(body, record.identity)) return false;
-      recordRevocation(record);
-      reclaim(assemblyFile(key), record);
-      return true;
+      const receipt = touchpointRevocationReceiptOf(body);
+      // An unqualified withdrawal applies to this placement in every requested
+      // language. A receipt names a delivery, including its other cached locales.
+      if (!receipt) fenceGroup(placementFenceName(key));
+      let reclaimed = false;
+      try {
+        // Requested locale is encoded in the file name, not record.locale:
+        // several requests may resolve to the same fallback language.
+        const dir = assembliesDirFor(key.scope);
+        for (const name of fs.readdirSync(dir)) {
+          const file = path.join(dir, name);
+          if (!name.endsWith('.json')) continue;
+          const stored = parseAssembly(file);
+          if (!stored || stored.scope !== key.scope) continue;
+          if (stored.placementKey !== key.placementKey) continue;
+          if (!touchpointWithdrawalReclaims(body, stored.identity)) continue;
+          recordRevocation(stored);
+          fenceGroup(`${key.scope}\u0000${path.basename(name, '.json')}`);
+          reclaim(file, stored);
+          reclaimed = true;
+        }
+      } catch {
+        // An absent/unreadable store is a cache miss, never a proxy failure.
+      }
+      return reclaimed;
+    },
+
+    refuseReplay(key, status) {
+      if (status === 404) fenceInFlight(key);
+      else fenceGroup(scopeFenceName(key.scope));
+      try {
+        const dir = assembliesDirFor(key.scope);
+        for (const name of fs.readdirSync(dir)) {
+          if (!name.endsWith('.json')) continue;
+          const file = path.join(dir, name);
+          if (status === 404 && file !== assemblyFile(key)) continue;
+          const record = parseAssembly(file);
+          if (!record || record.scope !== key.scope) continue;
+          writeFileAtomically(file, JSON.stringify({ ...record, replayRefused: true }));
+        }
+      } catch {
+        // Best effort, as with all cache writes. The response remains authoritative.
+      }
     },
 
     remember(key, response, ticket, requestElapsedMs = 0) {
@@ -899,6 +965,7 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
       if (answerPredatesStored(key, trimmed.serverTime, record)) return;
       writeFresh(key, {
         ...record,
+        replayRefused: false,
         schedule: touchpointScheduleOf(trimmed),
         identity,
         clock,
