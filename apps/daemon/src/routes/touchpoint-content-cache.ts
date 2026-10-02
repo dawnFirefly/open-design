@@ -103,9 +103,9 @@ export interface TouchpointContentCache {
    * stored record for; a 410 that arrives while the cache is empty, holds
    * another delivery, or carries no receipt at all leaves it nothing to date.
    * The ticket is local order instead: once a 410 for this placement has been
-   * handled, no answer to a request sent before it is written, whatever
-   * delivery it names. Such an answer is still served — only persisting it is
-   * refused — and the next request writes the cache again.
+   * handled, an older request cannot persist the withdrawn delivery. A precise
+   * receipt fences that delivery only; an unreadable receipt fences the placement.
+   * Such answers are still served; only persisting their authority is refused.
    */
   ticket(key: TouchpointContentKey): number;
   /**
@@ -128,6 +128,10 @@ export interface TouchpointContentCache {
    * `touchpointWithdrawalReclaims`.
    */
   forgetWithdrawn(key: TouchpointContentKey, body: unknown): boolean;
+  /** Pause placement replay while a received 410 receipt is still being read. Idempotent release. */
+  pauseReplay(key: TouchpointContentKey): () => void;
+  /** Account authority is independent of whether this request assembles content. */
+  refuseScope(scope: string): void;
   /** Retire display authority after authentication refusal or no decision; keep reusable bytes. */
   refuseReplay(key: TouchpointContentKey, status: 401 | 403 | 404): void;
 }
@@ -616,6 +620,9 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
    * to try. Bounded so a long-running daemon cannot grow it without limit.
    */
   const revocations = new Map<string, number>();
+  // Receipt fences outlive disk cleanup: an uncached locale may still be in flight.
+  const receiptFences = new Map<string, number>();
+  const replayPauses = new Map<string, number>();
   /** Per placement: the last ticket issued, and the last one a 410 overtook. */
   let tickets = 0;
   const withdrawnThrough = new Map<string, number>();
@@ -648,6 +655,12 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
       withdrawnThrough.get(scopeFenceName(key.scope)) ?? 0,
       withdrawnThrough.get(placementFenceName(key)) ?? 0,
     );
+  const receiptFenceName = (key: TouchpointContentKey, identity: TouchpointCachedIdentity): string =>
+    `${placementFenceName(key)}\u0000${deliveryName(key.scope, identity)}`;
+  const overtakenByReceipt = (key: TouchpointContentKey, response: unknown, ticket: number | undefined): boolean => {
+    const identity = touchpointCachedIdentityOf(response);
+    return ticket !== undefined && identity !== null && ticket <= (receiptFences.get(receiptFenceName(key, identity)) ?? 0);
+  };
   const overtakenByPendingWithdrawal = (
     key: TouchpointContentKey, response: unknown, ticket: number | undefined,
   ): boolean => ticket !== undefined && [...pendingWithdrawals.values()].some(withdrawal =>
@@ -660,9 +673,12 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
   const recordRevocation = (record: AssemblyRecord, observedAt?: number): void => {
     if (!record.identity) return;
     const name = deliveryName(record.scope, record.identity);
+    const estimated = observedAt === undefined ? serverTimeOf(record) :
+      statedServerTimeOf(record) + Math.max(0, observedAt - record.clock.fetchedAt);
+    const revokedAt = Number.isFinite(estimated) ? estimated : Number.POSITIVE_INFINITY;
+    const previous = revocations.get(name) ?? Number.NEGATIVE_INFINITY;
     revocations.delete(name);
-    revocations.set(name, observedAt === undefined ? serverTimeOf(record) :
-      statedServerTimeOf(record) + Math.max(0, observedAt - record.clock.fetchedAt));
+    revocations.set(name, Math.max(Number.isNaN(previous) ? Number.POSITIVE_INFINITY : previous, revokedAt));
     while (revocations.size > MAX_REVOCATIONS) {
       const oldest = revocations.keys().next().value;
       if (oldest === undefined) break;
@@ -792,7 +808,6 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
           !touchpointWithdrawalReclaims(withdrawal.body, record.identity)) continue;
         if (!retireReplay(file, record)) persisted = false;
         recordRevocation(record, withdrawal.observedAt);
-        fenceGroup(`${scope}\u0000${path.basename(file, '.json')}`, withdrawal.through);
         reclaim(file, record);
       }
       if (persisted) pendingWithdrawals.delete(name);
@@ -825,7 +840,7 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
       const record = readAssembly(key);
       if (!record || !recordStillHolds(record, held)) return null;
       const full = rebuild(key, record, trimmed);
-      if (full && !overtakenByWithdrawal(key, ticket) && !overtakenByPendingWithdrawal(key, full, ticket))
+      if (full && !overtakenByWithdrawal(key, ticket) && !overtakenByPendingWithdrawal(key, full, ticket) && !overtakenByReceipt(key, full, ticket))
         adoptRenewal(key, record, full, trimmed, clock);
       return full;
     },
@@ -836,6 +851,7 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
 
     replayOffline(key, reason) {
       retryRefusals(key.scope);
+      if (replayPauses.has(placementFenceName(key))) return null;
       const file = assemblyFile(key);
       const scopeRefusal = refusedScopes.get(key.scope);
       const stored = pendingWithdrawals.size ? readAssembly(key) : null;
@@ -871,11 +887,17 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
     },
 
     forgetWithdrawn(key, body) {
-      fenceInFlight(key);
       const receipt = touchpointRevocationReceiptOf(body);
       // An unqualified withdrawal applies to this placement in every requested
       // language. A receipt names a delivery, including its other cached locales.
       if (!receipt) fenceGroup(placementFenceName(key));
+      else {
+        const name = receiptFenceName(key, receipt);
+        const through = Math.max(receiptFences.get(name) ?? 0, tickets);
+        receiptFences.delete(name);
+        receiptFences.set(name, through);
+        while (receiptFences.size > MAX_REVOCATIONS) receiptFences.delete(receiptFences.keys().next().value!);
+      }
       const withdrawalName = JSON.stringify([
         key.scope, key.placementKey,
         receipt ? [receipt.activityId, receipt.deploymentId, receipt.contentVersionId] : null,
@@ -900,7 +922,6 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
           if (!touchpointWithdrawalReclaims(body, stored.identity)) continue;
           if (!retireReplay(file, stored)) persisted = false;
           recordRevocation(stored);
-          fenceGroup(`${key.scope}\u0000${path.basename(name, '.json')}`);
           reclaim(file, stored);
           reclaimed = true;
         }
@@ -912,40 +933,28 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
       return reclaimed;
     },
 
-    refuseReplay(key, status) {
-      if (status === 404) {
-        fenceInFlight(key);
-        refusedFiles.add(assemblyFile(key));
-      } else {
-        fenceGroup(scopeFenceName(key.scope));
-        // Cover the whole account even if directory enumeration fails or one
-        // record cannot be persisted. Other accounts/environments stay usable.
-        refusedScopes.set(key.scope, new Set());
-      }
-      let persisted = true;
-      try {
-        const dir = assembliesDirFor(key.scope);
-        for (const name of fs.readdirSync(dir)) {
-          if (!name.endsWith('.json')) continue;
-          const file = path.join(dir, name);
-          if (status === 404 && file !== assemblyFile(key)) continue;
-          const record = parseAssembly(file);
-          if (!record) { persisted = false; continue; }
-          if (record.scope !== key.scope) continue;
-          if (!retireReplay(file, record)) persisted = false;
-        }
-      } catch {
-        persisted = false;
-      }
-      if (status !== 404 && persisted) refusedScopes.delete(key.scope);
+    pauseReplay(key) {
+      const name = placementFenceName(key);
+      replayPauses.set(name, (replayPauses.get(name) ?? 0) + 1);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        const remaining = (replayPauses.get(name) ?? 1) - 1;
+        if (remaining) replayPauses.set(name, remaining);
+        else replayPauses.delete(name);
+      };
     },
+
+    refuseScope(scope) { refuseAuthority(scope); },
+    refuseReplay(key, status) { refuseAuthority(key.scope, status === 404 ? key : undefined); },
 
     remember(key, response, ticket, requestElapsedMs = 0) {
       try {
         const clock = responseClock(requestElapsedMs);
         if (overtakenByWithdrawal(key, ticket)) return;
         if (!isRecord(response)) return;
-        if (overtakenByPendingWithdrawal(key, response, ticket)) return;
+        if (overtakenByPendingWithdrawal(key, response, ticket) || overtakenByReceipt(key, response, ticket)) return;
         const content = response.content;
         if (!isRecord(content)) return;
         const {
@@ -1050,6 +1059,35 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
       }
     },
   };
+
+  function refuseAuthority(scope: string, key?: TouchpointContentKey): void {
+    if (key !== undefined) {
+      fenceInFlight(key);
+      refusedFiles.add(assemblyFile(key));
+    } else {
+      fenceGroup(scopeFenceName(scope));
+      // Cover the whole account even if directory enumeration fails or one
+      // record cannot be persisted. Other accounts/environments stay usable.
+      refusedScopes.set(scope, new Set());
+    }
+    let persisted = true;
+    try {
+      const dir = assembliesDirFor(scope);
+      for (const name of fs.readdirSync(dir)) {
+        if (!name.endsWith('.json')) continue;
+        const file = path.join(dir, name);
+        if (key !== undefined && file !== assemblyFile(key)) continue;
+        const record = parseAssembly(file);
+        if (!record) { persisted = false; continue; }
+        if (record.scope !== scope) continue;
+        if (!retireReplay(file, record)) persisted = false;
+      }
+    } catch {
+      persisted = false;
+    }
+    if (key === undefined && persisted) refusedScopes.delete(scope);
+  }
+
 
   /** Capture the request anchor before synchronous content verification/storage. */
   function responseClock(requestElapsedMs: number): CachedClock {

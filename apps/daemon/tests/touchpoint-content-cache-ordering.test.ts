@@ -406,3 +406,117 @@ describe('touchpoint content cache answer ordering', () => {
     expect(replayAfterRestart()?.endsAt).toBe(iso(2 * HOUR));
   });
 });
+
+describe('pending revocation monotonicity', () => {
+  it.each([false, true])('must preserve latest revoke after earlier pending cleanup (earlierPending=%s)', earlierPending => {
+    const cache = createTouchpointContentCache(dataDir);
+    const alias = { ...key, locale: 'zh-TW' };
+    cache.remember(key, full({ serverTime: 0, endsAt: HOUR }));
+    // First 410 request already entered the real proxy's held -> ticket path.
+    cache.held(key);
+    cache.ticket(key);
+    let pendingReadFault: ReturnType<typeof vi.spyOn> | undefined;
+    if (earlierPending) {
+      pendingReadFault = vi.spyOn(fs, 'readdirSync').mockImplementation(() => { throw new Error('injected enumerate failure'); });
+      const removeFirst = vi.spyOn(fs, 'rmSync').mockImplementation(() => { throw new Error('injected initial unlink failure'); });
+      cache.forgetWithdrawn(key, null);
+      removeFirst.mockRestore();
+      // Enumeration remains broken through both later request-entry calls.
+    }
+    vi.advanceTimersByTime(500);
+    cache.held(alias); // Real request入口: retryRefusals cannot enumerate yet.
+    const lateTicket = cache.ticket(alias);
+    const lateGrant = full({ serverTime: 500, endsAt: HOUR });
+    cache.held(key); // Second precise 410 request is also already in flight.
+    cache.ticket(key);
+    pendingReadFault?.mockRestore(); // Restore enumeration only after request start.
+    vi.advanceTimersByTime(500);
+    const remove = vi.spyOn(fs, 'rmSync').mockImplementation(() => { throw new Error('injected unlink failure'); });
+    cache.forgetWithdrawn(key, { error: 'production_runtime_revoked', receipt: {
+      activityId: 'activity-1', deploymentId: 'deployment-1', contentVersionId: 'version-1', touchpointDecisionId: 'decision-1',
+    } });
+    remove.mockRestore();
+    cache.held(key); // Recover prior pending unqualified withdrawal; may overwrite the later revocation.
+    cache.remember(alias, lateGrant, lateTicket);
+    expect(cache.replayOffline(alias, 'upstream_unavailable')).toBeNull();
+  });
+});
+
+describe('receipt late-locale fences', () => {
+  const receipt = { error: 'production_runtime_revoked', receipt: {
+    activityId: 'activity-1', deploymentId: 'deployment-1', contentVersionId: 'version-1', touchpointDecisionId: 'decision-1',
+  } };
+  it('rejects a withdrawn delivery arriving late for a previously uncached locale', () => {
+    const cache = createTouchpointContentCache(dataDir);
+    const alias = { ...key, locale: 'zh-TW' };
+    // Ensure the account directory exists, with a different delivery at another locale.
+    cache.remember(key, { ...full({ serverTime: 0, endsAt: HOUR }), deploymentId: 'deployment-2' });
+    const lateTicket = cache.ticket(alias);
+    cache.forgetWithdrawn(key, receipt);
+    cache.remember(alias, full({ serverTime: 0, endsAt: HOUR }), lateTicket);
+    expect(cache.replayOffline(alias, 'upstream_unavailable')).toBeNull();
+  });
+  it('keeps the receipt fence after enumeration failure recovery with no matching stored delivery', () => {
+    const cache = createTouchpointContentCache(dataDir);
+    const alias = { ...key, locale: 'zh-TW' };
+    cache.remember(key, { ...full({ serverTime: 0, endsAt: HOUR }), deploymentId: 'deployment-2' });
+    const lateTicket = cache.ticket(alias);
+    const read = vi.spyOn(fs, 'readdirSync').mockImplementation(() => { throw new Error('injected'); });
+    cache.forgetWithdrawn(key, receipt);
+    read.mockRestore();
+    cache.held(key); // Trigger retryRefusals, which has no matching stored records to retire.
+    cache.remember(alias, full({ serverTime: 0, endsAt: HOUR }), lateTicket);
+    expect(cache.replayOffline(alias, 'upstream_unavailable')).toBeNull();
+  });
+  it('rejects an unqualified withdrawal arriving before an uncached locale answer', () => {
+    const cache = createTouchpointContentCache(dataDir);
+    const alias = { ...key, locale: 'zh-TW' };
+    cache.remember(key, { ...full({ serverTime: 0, endsAt: HOUR }), deploymentId: 'deployment-2' });
+    const lateTicket = cache.ticket(alias);
+    cache.forgetWithdrawn(key, null);
+    cache.remember(alias, full({ serverTime: 0, endsAt: HOUR }), lateTicket);
+    expect(cache.replayOffline(alias, 'upstream_unavailable')).toBeNull();
+  });
+});
+
+
+describe('delivery receipt fence recovery', () => {
+  const receipt = { error: 'production_runtime_revoked', receipt: {
+    activityId: 'activity-1', deploymentId: 'deployment-1', contentVersionId: 'version-1', touchpointDecisionId: 'decision-1',
+  } };
+  it.each([false, true])('rejects late trimmed authorization after cleanup (storageFault=%s)', storageFault => {
+    const cache = createTouchpointContentCache(dataDir);
+    const alias = { ...key, locale: 'zh-TW' };
+    const other = { ...full({ serverTime: 0, endsAt: HOUR }), deploymentId: 'deployment-2' };
+    cache.remember(key, other); cache.remember(alias, other);
+    const held = cache.held(alias)!; const old = cache.ticket(alias);
+    const read = storageFault ? vi.spyOn(fs, 'readdirSync').mockImplementation(() => { throw new Error('enumeration failed'); }) : null;
+    cache.forgetWithdrawn(key, receipt); read?.mockRestore(); cache.held(key);
+    expect(cache.reassemble(alias, held, trimmed({ serverTime: 0, endsAt: HOUR }), old)?.deploymentId).toBe('deployment-1');
+    expect(cache.replayOffline(alias, 'upstream_unavailable')?.deploymentId).toBe('deployment-2');
+    expect(createTouchpointContentCache(dataDir).replayOffline(alias, 'upstream_unavailable')?.deploymentId).toBe('deployment-2');
+    // Truly new authorization for the same delivery can restore this key.
+    cache.reassemble(alias, held, trimmed({ serverTime: 1_000, endsAt: HOUR }), cache.ticket(alias));
+    expect(cache.replayOffline(alias, 'upstream_unavailable')?.deploymentId).toBe('deployment-1');
+  });
+  it('a precise withdrawal never fences another in-flight delivery at the same locale', () => {
+    const cache = createTouchpointContentCache(dataDir);
+    cache.remember(key, full({ serverTime: 0, endsAt: HOUR }));
+    cache.held(key); const otherTicket = cache.ticket(key);
+    cache.forgetWithdrawn(key, receipt);
+    cache.remember(key, { ...full({ serverTime: 1_000, endsAt: HOUR }), deploymentId: 'deployment-2' }, otherTicket);
+    expect(cache.replayOffline(key, 'upstream_unavailable')?.deploymentId).toBe('deployment-2');
+  });
+  it('non-finite withdrawal estimates fail closed during retry recovery', () => {
+    const cache = createTouchpointContentCache(dataDir);
+    cache.remember(key, full({ serverTime: 0, endsAt: HOUR }));
+    const file = path.join(dataDir, records()[0]!);
+    const record = JSON.parse(fs.readFileSync(file, 'utf8'));
+    record.schedule.serverTime = 'invalid-server-clock';
+    fs.writeFileSync(file, JSON.stringify(record));
+    const read = vi.spyOn(fs, 'readdirSync').mockImplementation(() => { throw new Error('enumeration failed'); });
+    cache.forgetWithdrawn(key, null); read.mockRestore(); cache.held(key);
+    cache.remember(key, full({ serverTime: 1_000, endsAt: HOUR }), cache.ticket(key));
+    expect(cache.replayOffline(key, 'upstream_unavailable')).toBeNull();
+  });
+});

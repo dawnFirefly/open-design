@@ -320,10 +320,10 @@ export const touchpointEntersOfflineFallback = (error: unknown) =>
  * the fault ending, and that turns on one thing only — whether the browser's
  * OWN connection is what failed.
  *
- *  - `"announced"`. The device's network is what broke: a refused connection,
- *    a dead DNS, a request that burned its whole budget. Its repair fires
- *    `online`, usually with `focus` or `visibilitychange` behind it. The four
- *    events ARE the recovery signal and nothing else is needed.
+ *  - `"announced"`. The device explicitly reports offline. Wait for `online`,
+ *    `focus`, or `visibilitychange` to recheck instead of probing periodically.
+ *    A refused connection, DNS failure, or timeout alone does not establish
+ *    this state: when the device still reports online, recovery needs probes.
  *  - `"unannounced"`. Everything the browser can see is healthy and something
  *    it CANNOT see is down. `navigator.onLine` stays true, so `online` will
  *    never fire; a user who simply leaves the app open on the page the
@@ -336,11 +336,8 @@ export type TouchpointOfflineRecovery = "announced" | "unannounced";
  * The `"unannounced"` half of {@link TouchpointOfflineRecovery}, for a failure
  * that arrived as a thrown error.
  *
- * This covers a 5xx from the daemon ITSELF — the request crossed the network
- * and came back with an answer, so the network never broke. A timeout is
- * deliberately excluded: `refresh` already classifies a spent budget as "the
- * same condition as a refused connection, reported by a different observer",
- * and this must not quietly reclassify it.
+ * This covers a 5xx from the daemon itself. Transport failures and timeouts
+ * also need bounded probes whenever the device still reports online.
  *
  * Note what this does NOT cover, because it is most of the real traffic. An
  * unreachable RUNTIME never reaches this client as an error at all: the daemon
@@ -563,7 +560,7 @@ export function useTouchpointLifecycle<T>({ enabled, identity, load, onError, of
 		 * runtime exactly as unreachable as it was.
 		 */
 		const applyOfflineRecovery = (recovery: TouchpointOfflineRecovery | null) => {
-			if (recovery === "unannounced") armServerFaultHeartbeat();
+			if (recovery === "unannounced" && !browserReportsOffline()) armServerFaultHeartbeat();
 			else stopServerFaultHeartbeat();
 		};
 		/**
@@ -596,13 +593,8 @@ export function useTouchpointLifecycle<T>({ enabled, identity, load, onError, of
 						recoverable = held;
 					}
 				}
-				// Keyed on the LATEST failure rather than the one that entered
-				// fallback, so the heartbeat is armed exactly while the current
-				// evidence says nothing will announce recovery. A 5xx that decays
-				// into a dead transport hands the job back to `online`; a dead
-				// transport that comes back to a still-broken server takes it up
-				// again on that server's next 5xx.
-				applyOfflineRecovery(touchpointFallbackFromServerError(error) ? "unannounced" : "announced");
+				// Only an explicit device-offline signal can announce recovery reliably.
+				applyOfflineRecovery(browserReportsOffline() ? "announced" : "unannounced");
 			}
 			if (touchpointWithdrawsDisplay(error) || !recoverable || elapsed(recoverable.start) >= recoverable.validForMs) {
 				revalidationLease = null;
@@ -863,7 +855,7 @@ export function useTouchpointLifecycle<T>({ enabled, identity, load, onError, of
 			if (live) void refresh();
 			else wake();
 		};
-		const cancelOnOffline = () => cancelRequest();
+		const cancelOnOffline = () => { cancelRequest(); stopServerFaultHeartbeat(); };
 		void refresh();
 		// A tick is a question the network cannot answer while it is down, so the
 		// interval stands down and recovery is event-driven until it is back.

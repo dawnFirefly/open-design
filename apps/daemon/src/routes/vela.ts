@@ -549,14 +549,11 @@ const touchpointStatusRefusesReplay = (status: number): boolean =>
 const HELD_CONTENT_PARAMS = ['heldContentId', 'heldContentLocale'] as const;
 
 /**
- * The (placementKey, locale) a production decision request is about, or `null`
- * when this request is not one the daemon may assemble content for.
+ * The (placementKey, locale) whose display authority a production decision answers.
  *
- * A caller that already carries either held-content parameter is passed through
- * untouched: the daemon never rewrites someone else's conditional request.
+ * Conditional caller parameters affect assembly eligibility separately.
  */
 function touchpointContentKeyForRequest(url: URL, scope: string): TouchpointContentKey | null {
-  if (HELD_CONTENT_PARAMS.some((param) => url.searchParams.has(param))) return null;
   const placementKey = url.searchParams.get('placementKey');
   const locale = url.searchParams.get('locale');
   return placementKey && locale ? { scope, placementKey, locale } : null;
@@ -635,13 +632,11 @@ function proxyTouchpointRuntimeRequest(
   const body = req.method === 'POST' ? velaProxyRequestBody(req) : null;
   // Content assembly applies to exactly one route: the read-only production
   // decision. Everything else keeps the verbatim streaming path.
-  const contentKey =
-    contentCache && runtime === 'production' && req.method === 'GET' && suffix === '/production'
-      ? touchpointContentKeyForRequest(
-          target,
-          touchpointCacheScope({ ...context, controlKey: context.controlKey }),
-        )
-      : null;
+  const authorityScope = runtime === 'production'
+    ? touchpointCacheScope({ ...context, controlKey: context.controlKey }) : null;
+  const authorityKey = contentCache && authorityScope && req.method === 'GET' && suffix === '/production'
+    ? touchpointContentKeyForRequest(target, authorityScope) : null;
+  const contentKey = !HELD_CONTENT_PARAMS.some(param => target.searchParams.has(param)) ? authorityKey : null;
 
   const controlKey = context.controlKey;
   /**
@@ -667,14 +662,16 @@ function proxyTouchpointRuntimeRequest(
    * a megabyte-scale package for a response nobody will ever read.
    */
   let callerGone = false;
+  let settlePendingWithdrawal: ((body: unknown) => void) | null = null;
   const abortUpstream = (): void => {
     callerGone = true;
+    settlePendingWithdrawal?.(null);
     const pending = currentUpstream;
     if (pending && !res.writableEnded && !pending.destroyed) pending.destroy();
   };
   req.once('aborted', abortUpstream);
   res.once('close', abortUpstream);
-  if (contentKey && contentCache) {
+  if (authorityKey && contentCache) {
     // Destroying with an error routes into the ordinary unreachable path,
     // which answers from the store when it can and with 502 when it cannot.
     const budget = setTimeout(() => {
@@ -754,8 +751,18 @@ function proxyTouchpointRuntimeRequest(
      */
     let upstreamStatus: number | null = null;
     const refuseCachedAuthority = (status: number): void => {
-      if (contentKey && contentCache && (status === 401 || status === 403 || status === 404))
-        contentCache.refuseReplay(contentKey, status);
+      if (!contentCache) return;
+      if (authorityScope && (status === 401 || status === 403)) contentCache.refuseScope(authorityScope);
+      else if (authorityKey && status === 404) contentCache.refuseReplay(authorityKey, status);
+    };
+    let releaseWithdrawal: (() => void) | null = null;
+    const settleWithdrawal = (body: unknown): void => {
+      if (!releaseWithdrawal) return;
+      const release = releaseWithdrawal;
+      releaseWithdrawal = null;
+      settlePendingWithdrawal = null;
+      try { if (authorityKey && contentCache) contentCache.forgetWithdrawn(authorityKey, body); }
+      finally { release(); }
     };
     let cutShortSettled = false;
     /**
@@ -776,8 +783,7 @@ function proxyTouchpointRuntimeRequest(
       if (cutShortSettled) return;
       cutShortSettled = true;
       if (upstreamStatus !== null && touchpointStatusRefusesReplay(upstreamStatus)) {
-        if (upstreamStatus === 410 && contentKey && contentCache)
-          contentCache.forgetWithdrawn(contentKey, null);
+        if (upstreamStatus === 410) settleWithdrawal(null);
         if (res.headersSent) res.end();
         else if (!callerGone && !res.writableEnded)
           res.status(upstreamStatus).json({ error: 'touchpoint_runtime_response_incomplete' });
@@ -795,7 +801,12 @@ function proxyTouchpointRuntimeRequest(
     const requestStarted = performance.now();
     const requestElapsed = () => Math.max(0, performance.now() - requestStarted);
     const upstream = transport.request(attempt, { method: req.method, headers }, (upstreamRes) => {
+      if (callerGone) { upstreamRes.destroy(); return; }
       upstreamStatus = upstreamRes.statusCode ?? null;
+      if (upstreamStatus === 410 && authorityKey && contentCache) {
+        releaseWithdrawal = contentCache.pauseReplay(authorityKey);
+        settlePendingWithdrawal = settleWithdrawal;
+      }
       // The status itself retires the old grant, even if the body is cut off,
       // oversized, or unreadable. Keep bytes for a later authenticated renewal.
       if (upstreamStatus !== null) refuseCachedAuthority(upstreamStatus);
@@ -809,7 +820,7 @@ function proxyTouchpointRuntimeRequest(
           res.setHeader('content-encoding', contentEncoding);
         pipeProxyStreamWithGuard(upstreamRes, res, () => res.destroy());
       };
-      if (!contentKey || !contentCache) {
+      if (!contentCache || (!contentKey && !(authorityKey && upstreamStatus === 410))) {
         passThrough();
         return;
       }
@@ -871,8 +882,8 @@ function proxyTouchpointRuntimeRequest(
        */
       const settleOversizedStatus = (): boolean => {
         const status = upstreamRes.statusCode ?? 502;
-        if (status === 410 && contentKey && contentCache) {
-          contentCache.forgetWithdrawn(contentKey, null);
+        if (status === 410) {
+          settleWithdrawal(null);
           // The 410 itself still goes to the browser, exactly as upstream
           // framed it. Deciding what to do with it is not this proxy's job.
           return false;
@@ -934,14 +945,14 @@ function proxyTouchpointRuntimeRequest(
           // the daemon and the browser cannot disagree about what a 410 means.
           // The 410 itself is forwarded either way — deciding what the browser
           // does with it is not this proxy's job.
-          if (status === 410 && contentKey && contentCache) {
+          if (status === 410) {
             let body: unknown = null;
             try {
               if (decoded) body = JSON.parse(decoded.toString('utf8'));
             } catch {
               body = null;
             }
-            contentCache.forgetWithdrawn(contentKey, body);
+            settleWithdrawal(body);
           }
           // 5xx is "temporarily unavailable", which is a transport condition
           // wearing a status code. Everything else — 401, 403, 404, 410 — is an
@@ -949,7 +960,7 @@ function proxyTouchpointRuntimeRequest(
           else if (touchpointStatusIsTransient(status) && answerFromCache('upstream_unavailable'))
             return;
         }
-        if (!decoded || status !== 200) {
+        if (!contentKey || !decoded || status !== 200) {
           echo();
           return;
         }

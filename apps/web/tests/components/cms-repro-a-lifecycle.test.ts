@@ -351,3 +351,29 @@ describe("OPEND-3436 Test channel", () => {
     expect(probe.result.current?.isAuthorized()).toBe(true);
   });
 });
+
+
+describe("online fallback recovery bounds", () => {
+  it.each(["timeout", "transport"] as const)("probes five minutes after online %s, then restores thirty-second renewal", async kind => {
+    let fail = false;
+    const load = vi.fn<Load>().mockImplementation(() => !fail ? Promise.resolve(grant()) : kind === "timeout"
+      ? new Promise(() => {}) : Promise.reject(Object.assign(new Error("transport"), { touchpointOfflineFallback: true })));
+    const { result } = renderHook(() => useTouchpointLifecycle({ enabled: true, identity: "A", load, offlineFallback: true }));
+    await step(); fail = true; await step(30_000);
+    if (kind === "timeout") await step(REQUEST_TIMEOUT_MS);
+    expect(result.current.current).not.toBeNull();
+    fail = false;
+    await step(SERVER_FAULT_HEARTBEAT_MS - 1); expect(load).toHaveBeenCalledTimes(2);
+    await step(1); expect(load).toHaveBeenCalledTimes(3);
+    await step(30_000); expect(load).toHaveBeenCalledTimes(4);
+  });
+  it("does not probe a transport fallback while the device explicitly reports offline", async () => {
+    const online = vi.spyOn(navigator, "onLine", "get").mockReturnValue(true);
+    const load = vi.fn<Load>().mockResolvedValueOnce(grant()).mockRejectedValue(Object.assign(new Error("transport"), { touchpointOfflineFallback: true }));
+    renderHook(() => useTouchpointLifecycle({ enabled: true, identity: "A", load, offlineFallback: true }));
+    await step(); await step(30_000); online.mockReturnValue(false); wake("offline");
+    await step(SERVER_FAULT_HEARTBEAT_MS * 2); expect(load).toHaveBeenCalledTimes(2);
+    online.mockReturnValue(true); load.mockResolvedValue(grant()); wake("online"); await step();
+    expect(load).toHaveBeenCalledTimes(3);
+  });
+});

@@ -975,3 +975,39 @@ describe("ProductionCampaignHover", () => {
 		expect(screen.getByTestId("production-hover-overlay")).toHaveTextContent("zh-CN");
 	});
 });
+
+describe('online timeout recovery', () => {
+  it('probes five minutes after asymmetric timeout and resumes normal thirty-second renewal', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'performance', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(false);
+    vi.spyOn(navigator, 'onLine', 'get').mockReturnValue(true);
+    let mode = 'fresh';
+    let late!: (response: Response) => void;
+    let signal!: AbortSignal;
+    const fresh = (placement: string) => new Response(JSON.stringify(decision(placement, {
+      endsAt: '2030-01-01T01:00:00.000Z', authorizationExpiresAt: '2030-01-01T01:00:00.000Z',
+    })));
+    const fetchMock = vi.fn((url: string, init: RequestInit) => {
+      const placement = new URL(url, 'http://daemon.invalid').searchParams.get('placementKey')!;
+      if (mode === 'fresh') return Promise.resolve(fresh(placement));
+      if (placement.endsWith('hover-entry')) return Promise.resolve(new Response(JSON.stringify({
+        error: 'production_runtime_revoked', receipt: {
+          activityId: 'activity-1', deploymentId: 'other', contentVersionId: `version-${placement}`, touchpointDecisionId: `decision-${placement}`,
+        },
+      }), { status: 410 }));
+      signal = init.signal as AbortSignal;
+      return new Promise<Response>(resolve => { late = resolve; });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const step = async (ms = 0) => { await act(async () => { await vi.advanceTimersByTimeAsync(ms); }); };
+    await act(async () => { render(<ProductionCampaignHover authenticated sessionSubject="A" />); });
+    expect(screen.getByTestId('production-hover-overlay')).toBeTruthy();
+    mode = 'pending'; await step(30_000); await step(15_000);
+    expect(signal.aborted).toBe(true);
+    mode = 'fresh'; await act(async () => { late(fresh('opend.home.hover-layer')); });
+    await step(299_999); expect(fetchMock).toHaveBeenCalledTimes(4);
+    await step(1); expect(fetchMock).toHaveBeenCalledTimes(6);
+    await step(30_000); expect(fetchMock).toHaveBeenCalledTimes(8);
+    expect(screen.getByTestId('production-hover-overlay')).toBeTruthy();
+  });
+});

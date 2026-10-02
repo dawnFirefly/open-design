@@ -70,7 +70,9 @@ beforeEach(() => {
 	clicked = undefined;
 	diagnostics = [];
 	document.addEventListener("touchpointdiagnostic", captureDiagnostic);
-	vi.stubGlobal("navigator", Object.create(navigator, {
+	const browserNavigator = navigator;
+	vi.stubGlobal("navigator", Object.create(browserNavigator, {
+		onLine: { configurable: true, get: () => browserNavigator.onLine },
 		userActivation: { configurable: true, get: () => ({ isActive: true, hasBeenActive: true }) },
 	}));
 	vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
