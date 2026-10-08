@@ -41,10 +41,14 @@ export function redactVelaCommandError(error: unknown, args: readonly string[]):
   if (typeof error !== 'object' || error === null) return error;
   const pairs: Array<{ flag: string; value: string }> = [];
   for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index]!;
+    // Callers are typed, but redaction must never turn a command failure
+    // into a different crash, so tolerate non-string argv entries.
+    const arg: unknown = args[index];
+    if (typeof arg !== 'string') continue;
     const equals = arg.indexOf('=');
-    if (REDACTED_VELA_ARG_FLAGS.has(arg) && index + 1 < args.length) {
-      pairs.push({ flag: arg, value: args[index + 1]! });
+    const next: unknown = args[index + 1];
+    if (REDACTED_VELA_ARG_FLAGS.has(arg) && typeof next === 'string') {
+      pairs.push({ flag: arg, value: next });
       index += 1;
     } else if (equals > 0 && REDACTED_VELA_ARG_FLAGS.has(arg.slice(0, equals))) {
       pairs.push({ flag: arg.slice(0, equals), value: arg.slice(equals + 1) });
