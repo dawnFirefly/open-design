@@ -41,6 +41,7 @@ vi.mock('node:crypto', async (importOriginal) => {
 import { closeDatabase, openDatabase } from '../src/db.js';
 import { AGENT_DEFS } from '../src/runtimes/registry.js';
 import { agentBinEnvKey } from '../src/runtimes/executables.js';
+import { execAgentFile } from '../src/runtimes/invocation.js';
 import {
   getInstalledPlugin,
   resolvePluginFolder,
@@ -214,6 +215,30 @@ describe('OD Next automatic production through the real server', () => {
         }
       }
     }
+  });
+
+  it.each([
+    ['public', 'models'], ['public', 'auth'],
+    ['strategy', 'models'], ['strategy', 'auth'],
+  ] as const)('%s Codex fixture answers %s probes without stdin or a generation', async (kind, probe) => {
+    binDir = await mkdtemp(path.join(os.tmpdir(), 'od-next-codex-probes-'));
+    const fixture = kind === 'public'
+      ? await writePublicRolloutCodex(binDir, 'probe-metadata')
+      : await writeStrategyCodex(binDir);
+    const def = AGENT_DEFS.find(agent => agent.id === 'codex')!;
+    const probeDefinition = probe === 'models' ? def.listModels! : def.authProbe!;
+    // Use the real probe launcher: stdin stays open, as it does during detection.
+    // The timeout is only a failure bound; successful probes exit on their own.
+    const { stdout } = await execAgentFile(fixture.bin, probeDefinition.args, {
+      cwd: binDir,
+      timeout: probeDefinition.timeoutMs,
+    });
+    if (probe === 'models') {
+      expect(def.listModels!.parse(String(stdout))).toContainEqual({ id: 'gpt-5.5', label: 'gpt-5.5' });
+    } else {
+      expect(stdout).toContain('Logged in using ChatGPT');
+    }
+    await expect(readFile(fixture.logPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('isolates host CLI probes while retaining real selected Codex detection and preflight', async () => {
@@ -2826,6 +2851,9 @@ const argv = process.argv.slice(2);
 const logPath = ${JSON.stringify(logPath)};
 if (argv.includes('--version')) { console.log(${JSON.stringify(agentCliVersion)}); process.exit(0); }
 if (argv.includes('--help')) { console.log('Usage: codex exec'); process.exit(0); }
+// Metadata probes never consume a generation prompt on stdin.
+if (argv[0] === 'debug' && argv[1] === 'models') { console.log(JSON.stringify({ models: [{ id: 'gpt-5.5' }] })); process.exit(0); }
+if (argv[0] === 'login' && argv[1] === 'status') { console.log('Logged in using ChatGPT'); process.exit(0); }
 let stdin = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => { stdin += chunk; });
@@ -3122,6 +3150,9 @@ const logPath = ${JSON.stringify(logPath)};
 ${probeLogPath ? `if (argv.includes('--version') || argv.includes('--help') || argv[0] === 'debug' && argv[1] === 'models' || argv[0] === 'login' && argv[1] === 'status') fs.appendFileSync(${JSON.stringify(probeLogPath)}, JSON.stringify(argv) + '\\n');` : ''}
 if (argv.includes('--version')) { console.log('codex-cli 0.147.0'); process.exit(0); }
 if (argv.includes('--help')) { console.log('Usage: codex exec [--sandbox MODE]'); process.exit(0); }
+// Answer probes before failure/generation handling, without waiting for stdin.
+if (argv[0] === 'debug' && argv[1] === 'models') { console.log(JSON.stringify({ models: [{ id: 'gpt-5.5' }] })); process.exit(0); }
+if (argv[0] === 'login' && argv[1] === 'status') { console.log('Logged in using ChatGPT'); process.exit(0); }
 if (fs.existsSync(logPath + '.fail-start')) {
   process.stderr.write('fixture: process exited before session start\\n');
   process.exit(1);
