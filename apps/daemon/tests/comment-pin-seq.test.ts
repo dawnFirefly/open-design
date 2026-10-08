@@ -77,6 +77,28 @@ describe('push receipt author identity', () => {
   });
 });
 
+describe('preview comment ids', () => {
+  it('uses a full UUID suffix for new comments and keeps existing short ids editable', () => {
+    const db = seededDb();
+    const created = upsertPreviewComment(db, 'project-1', 'conversation-1', {
+      target: target(), note: 'new comment',
+    });
+    expect(created?.id).toMatch(/^cmt_[0-9a-f]{32}$/);
+
+    const legacyId = 'cmt_1234abcd';
+    const legacy = upsertPreviewComment(db, 'project-1', 'conversation-1', {
+      id: legacyId, target: target({ elementId: 'legacy' }), note: 'before edit',
+    });
+    const edited = upsertPreviewComment(db, 'project-1', 'conversation-1', {
+      id: legacyId, target: target({ elementId: 'legacy' }), note: 'after edit',
+    });
+
+    expect(legacy?.id).toBe(legacyId);
+    expect(edited?.id).toBe(legacyId);
+    expect(getPreviewComment(db, 'project-1', 'conversation-1', legacyId)?.note).toBe('after edit');
+  });
+});
+
 describe('pin_seq assignment (recvq5BVsolIxi)', () => {
   it('assigns pin_seq starting at 1 and never rewrites it on a later edit', () => {
     const db = seededDb();
