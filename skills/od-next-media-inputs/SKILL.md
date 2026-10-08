@@ -50,6 +50,10 @@ Decide each slot's route from what it shows, following the Core imagery rule:
   unavailable.
 - Chart, diagram, icon, or text-heavy image: build it in code.
 
+A dish, cuisine, or product category is illustrative however famous its name;
+only a specific instance, such as a named real restaurant's own dish or one
+brand's product, is a real referent.
+
 When the user explicitly asks for real photos or for generated images, follow
 that request.
 
