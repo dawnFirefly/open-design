@@ -1567,6 +1567,12 @@ export function registerCollabSyncRoutes(
       return res.json(withVisibility(sharePublishResponse(resumed,
         presentPublicShareLink(deps.resolvePublicShareLink, projectId, resumed.receipt.slug, resumed.amrLink ?? null))));
     }
+    // Vela refuses a plain publish to a stopped binding (409
+    // share_binding_stopped). Refuse before uploading; reopening the original
+    // link is the explicit `{ mode: 'resume' }` request (OPEND-3510).
+    if (stoppedSlug) {
+      return res.status(409).json(withVisibility({ error: 'SHARE_STOPPED_RESUME_REQUIRED' }));
+    }
     const resourceId = publicFileResourceIdFor(scope);
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'od-public-file-'));
     let stage: 'push' | 'snapshot' | 'persist' = 'push';

@@ -125,7 +125,7 @@ for (const scenario of cases) it.each([false, true])(`${scenario.name}: HTTP pub
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); runtime.dispose(); db.close(); await rm(root, { recursive: true, force: true }); }
 });
 
-it('HTTP owner republish rejects a stopped alias if the old CLI returns binding_pending', async () => {
+it('HTTP owner plain republish of a stopped link is refused before uploading (OPEND-3510)', async () => {
   const root = await mkdtemp(join(tmpdir(), 'od-resume-http-'));
   const db = new Database(':memory:');
   migratePublicFilePublications(db); migrateCommentRelayOutbox(db);
@@ -156,11 +156,14 @@ it('HTTP owner republish rejects a stopped alias if the old CLI returns binding_
     const revision = store.getRevision(scope);
     const start = options.commands.length;
     const response = await fetch(url, { method: 'POST' });
-    expect(response.status).toBe(502);
-    expect(await response.json()).toEqual({ error: 'PUBLIC_FILE_PUBLISH_UNAVAILABLE', failure: { stage: 'snapshot', reason: 'unknown' } });
-    expect(options.commands.slice(start).map(args => args.slice(0, 2))).toEqual([['resource', 'push'], ['share', 'publish']]);
+    // Vela refuses a plain publish to a stopped binding (409
+    // share_binding_stopped). Say so before spending an upload; reopening the
+    // original link is the explicit `{ mode: 'resume' }` request.
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: 'SHARE_STOPPED_RESUME_REQUIRED' });
+    expect(options.commands.slice(start)).toEqual([]);
     expect(store.getRevision(scope)).toEqual(revision);
-    expect(uploads).toBe(2);
+    expect(uploads).toBe(1);
     expect((await fixture.readProjectShareState!(scope)).publications[0]).toMatchObject({ status: 'stopped', slug: fixtureShareSlug });
     expect(createShareBindingOutbox(db).list()).toEqual([]);
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); runtime.dispose(); db.close(); await rm(root, { recursive: true, force: true }); }
