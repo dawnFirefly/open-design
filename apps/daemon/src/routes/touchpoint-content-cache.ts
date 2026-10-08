@@ -1150,7 +1150,17 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
   function writeFresh(key: TouchpointContentKey, record: AssemblyRecord): void {
     const file = assemblyFile(key);
     const clock = { ...record.clock, observedAt: Math.max(record.clock.observedAt, nowEstimate()) };
-    writeFileAtomically(file, JSON.stringify({ ...record, clock }));
+    try {
+      writeFileAtomically(file, JSON.stringify({ ...record, clock }));
+    } catch (error) {
+      // The new answer supersedes the old grant even when replacement fails.
+      // Retire the candidate, preserving its server-time ordering fence and
+      // reusable bytes; an older answer must not revive the previous window.
+      // Only a subsequent successfully stored online grant clears this block.
+      retireReplay(file, { ...record, clock });
+      armExpiryForFresh(file, record.schedule, Math.max(0, nowEstimate() - clock.fetchedAt));
+      throw error;
+    }
     refusedFiles.delete(file);
     refusedScopes.get(key.scope)?.add(file);
     for (const withdrawal of pendingWithdrawals.values()) {
@@ -1169,8 +1179,8 @@ export function createTouchpointContentCache(runtimeDataDir: string): Touchpoint
    * very version `held` named), so only the envelope, schedule, identity and
    * clock are replaced — with the same REPLACE, never-merge rule `remember`
    * follows, so a renewal that ends the activity early takes effect offline
-   * too. Best-effort like every write here: failing to persist leaves the
-   * previous record, never a wrong one being served now.
+   * too. Failing to persist retires offline authority; the rebuilt online
+   * answer remains available to the caller.
    */
   function adoptRenewal(
     key: TouchpointContentKey,

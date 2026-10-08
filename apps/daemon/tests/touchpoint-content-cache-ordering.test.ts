@@ -77,6 +77,63 @@ afterEach(() => {
 describe('touchpoint content cache answer ordering', () => {
   const ioFailure = () => Object.assign(new Error('injected cache storage failure'), { code: 'EACCES' });
 
+  it.each(['full', 'trimmed'] as const)('never replays the old window after a shortened %s answer fails assembly replacement', kind => {
+    const cache = createTouchpointContentCache(dataDir);
+    const alias = { ...key, locale: 'zh-TW' };
+    const account = { ...key, scope: 'production:B' };
+    for (const candidate of [key, alias, account])
+      cache.remember(candidate, full({ serverTime: 0, endsAt: HOUR }));
+    const held = cache.held(key)!;
+    const ticket = cache.ticket(key);
+    vi.advanceTimersByTime(1_000);
+    const renameFile = fs.renameSync.bind(fs);
+    let failed = false;
+    const rename = vi.spyOn(fs, 'renameSync').mockImplementation((source, target) => {
+      if (!failed && String(target).includes('/assemblies/')) {
+        failed = true;
+        throw ioFailure();
+      }
+      return renameFile(source, target);
+    });
+    if (kind === 'full') cache.remember(key, full({ serverTime: 1_000, endsAt: 2_000 }), ticket);
+    else expect(cache.reassemble(key, held, trimmed({ serverTime: 1_000, endsAt: 2_000 }), ticket)?.endsAt).toBe(iso(2_000));
+    expect(failed).toBe(true);
+    rename.mockRestore(); // Only one assembly rename failed; storage has recovered.
+    vi.advanceTimersByTime(2_000);
+    expect(cache.replayOffline(key, 'upstream_unavailable')).toBeNull();
+    expect(replayAfterRestart()).toBeNull();
+    for (const candidate of [alias, account])
+      expect(cache.replayOffline(candidate, 'upstream_unavailable')?.endsAt).toBe(iso(HOUR));
+    // A subsequent fresh online grant can restore offline authority.
+    cache.remember(key, full({ serverTime: 3_000, endsAt: HOUR }), cache.ticket(key));
+    expect(cache.replayOffline(key, 'upstream_unavailable')?.endsAt).toBe(iso(HOUR));
+    expect(replayAfterRestart()?.endsAt).toBe(iso(HOUR));
+  });
+
+  it.each(['full', 'trimmed'] as const)('keeps the failed %s replacement ordered until a fresh trimmed grant recovers it', kind => {
+    const cache = createTouchpointContentCache(dataDir);
+    cache.remember(key, full({ serverTime: 0, endsAt: HOUR }));
+    const held = cache.held(key)!;
+    vi.advanceTimersByTime(1_000);
+    const renameFile = fs.renameSync.bind(fs);
+    const rename = vi.spyOn(fs, 'renameSync').mockImplementation((source, target) => {
+      if (String(target).includes('/assemblies/')) throw ioFailure();
+      return renameFile(source, target);
+    });
+    if (kind === 'full') cache.remember(key, full({ serverTime: 1_000, endsAt: 2_000 }), cache.ticket(key));
+    else cache.reassemble(key, held, trimmed({ serverTime: 1_000, endsAt: 2_000 }), cache.ticket(key));
+    rename.mockRestore(); // Direct retirement must preserve the failed answer's ordering fence.
+    cache.remember(key, full({ serverTime: 500, endsAt: HOUR }), cache.ticket(key));
+    cache.reassemble(key, held, trimmed({ serverTime: 500, endsAt: HOUR }), cache.ticket(key));
+    expect(cache.replayOffline(key, 'upstream_unavailable')).toBeNull();
+    expect(replayAfterRestart()).toBeNull();
+    expect(cache.held(key)).toEqual(held);
+    vi.advanceTimersByTime(500);
+    expect(cache.reassemble(key, held, trimmed({ serverTime: 1_500, endsAt: HOUR }), cache.ticket(key))).not.toBeNull();
+    expect(cache.replayOffline(key, 'upstream_unavailable')?.endsAt).toBe(iso(HOUR));
+    expect(replayAfterRestart()?.endsAt).toBe(iso(HOUR));
+  });
+
   it.each([401, 403, 404] as const)('persists refusal after %s when atomic replacement fails', status => {
     const cache = createTouchpointContentCache(dataDir);
     cache.remember(key, full({ serverTime: 0, endsAt: HOUR }));
