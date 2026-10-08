@@ -43,3 +43,18 @@ it('does not expose child stderr or retry after CLI failure', async () => {
   await expect(publishVelaShareVersion(input, run)).rejects.toThrow(/^PUBLIC_SHARE_PUBLISH_FAILED$/);
   expect(run).toHaveBeenCalledTimes(1);
 });
+
+it('OPEND-3510: keeps the upstream status and code of a refused publish, but no other child output', async () => {
+  const { classifyVelaCommandFailure } = await import('../src/collab/public-file-failure.js');
+  const refusal = Object.assign(new Error('Command failed: vela share publish resource --name Secret Design'), {
+    stderr: 'Error: API request failed with status 409: share_binding_stopped\nbody: {"secret":"upstream body"}\n',
+  });
+  const run = vi.fn<typeof runVelaCommand>().mockRejectedValue(refusal);
+  const failure = await publishVelaShareVersion(input, run).catch((error: unknown) => error);
+  expect(failure).toBeInstanceOf(Error);
+  expect((failure as Error).message).toBe('PUBLIC_SHARE_PUBLISH_FAILED');
+  expect(classifyVelaCommandFailure('snapshot', failure)).toEqual({
+    stage: 'snapshot', reason: 'upstream_http', upstreamStatus: 409, upstreamCode: 'share_binding_stopped',
+  });
+  expect(JSON.stringify(failure) + String((failure as { stderr?: unknown }).stderr)).not.toContain('upstream body');
+});

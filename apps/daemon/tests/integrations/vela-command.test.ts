@@ -91,6 +91,39 @@ describe('runVelaCommand', () => {
     vi.unstubAllEnvs();
   });
 
+  it('OPEND-3520: redacts identity flag values from a failed command without hiding the upstream status', async () => {
+    const failure = Object.assign(
+      new Error(
+        'Command failed: /bin/vela presence heartbeat p1 --client-id m1 --display-name 张 三'
+          + ' --activity-json {"file":"secret-plan.html"}'
+          + '\nError: API request failed with status 404: not_found',
+      ),
+      {
+        code: 1,
+        cmd: '/bin/vela presence heartbeat p1 --client-id m1 --display-name 张 三 --activity-json {"file":"secret-plan.html"}',
+      },
+    );
+    execFileMock.mockImplementation((_command: string, _args: string[], _options: unknown, callback: (error: Error) => void) => {
+      callback(failure);
+      return { pid: 4321 };
+    });
+    const rejection = await runVelaCommand(
+      ['presence', 'heartbeat', 'p1', '--client-id', 'm1', '--display-name', '张 三',
+        '--activity-json', '{"file":"secret-plan.html"}'],
+      { env: { VELA_BIN: process.execPath, OD_DATA_DIR: '' } },
+    ).then(
+      () => { throw new Error('expected the command to reject'); },
+      (error: unknown) => error as Error & { cmd?: string },
+    );
+    expect(rejection).toBe(failure);
+    for (const text of [rejection.message, rejection.cmd ?? '']) {
+      expect(text).not.toContain('张 三');
+      expect(text).not.toContain('secret-plan.html');
+      expect(text).toContain('--display-name [REDACTED]');
+    }
+    expect(rejection.message).toContain('API request failed with status 404');
+  });
+
   it('uses the configured AMR binary and feature-test login profile', async () => {
     const stdout = await runVelaCommand(['resource', 'head', 'project-1'], {
       env: {

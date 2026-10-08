@@ -1,7 +1,7 @@
 import type { SharePublishResult } from '@open-design/contracts';
 import type { PublicFilePublicationScope } from './public-file-publication-store.js';
 import type { createShareAliasReservations } from './share-alias-reservation.js';
-import { runVelaCommand, velaWorkspaceCommandOptions } from '../integrations/vela-command.js';
+import { runVelaCommand, velaCommandStderr, velaWorkspaceCommandOptions } from '../integrations/vela-command.js';
 import { parseAmrShareLink, type AmrShareLink } from './public-share-viewer-url.js';
 
 /** A publish outcome plus what AMR said about its address. Only a published
@@ -89,9 +89,14 @@ export async function publishVelaShareVersion(
     if (record.status !== 'published') throw new Error('unconfirmed publish outcome');
     const amrLink = parseAmrShareLink(record, request.projectId, request.slug);
     return { status: 'published', receipt, ...(amrLink ? { amrLink } : {}) };
-  } catch {
+  } catch (error) {
     // Child diagnostics can include upstream bodies. No fallback to snapshots
-    // or implicit retry: the remote pointer may already have advanced.
-    throw new Error('PUBLIC_SHARE_PUBLISH_FAILED');
+    // or implicit retry: the remote pointer may already have advanced. Keep
+    // only the upstream status/code line so the failure stays classifiable
+    // (e.g. 409 share_binding_stopped) instead of reason=unknown (OPEND-3510).
+    const failure = new Error('PUBLIC_SHARE_PUBLISH_FAILED');
+    const upstream = /API request failed with status \d{3}(?:: [^\s]+)?/.exec(velaCommandStderr(error));
+    if (upstream) Object.assign(failure, { stderr: upstream[0] });
+    throw failure;
   }
 }

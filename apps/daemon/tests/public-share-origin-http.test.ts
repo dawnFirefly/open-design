@@ -12,6 +12,7 @@ import { migratePublicFilePublications, createSqlitePublicFilePublicationStore }
 import { migrateCommentRelayOutbox } from '../src/collab/comment-relay-outbox.js';
 import { createShareBindingOutbox } from '../src/collab/share-binding-outbox.js';
 import { resolvePublicShareLink } from '../src/collab/public-share-viewer-url.js';
+import { createShareContentFingerprints } from '../src/collab/share-content-fingerprint.js';
 import { createPublicSharePublishingFixture, fixtureShareSlug } from './public-share-publishing-fixture.js';
 
 function assertJsonObject(value: unknown): asserts value is Record<string, unknown> {
@@ -124,7 +125,7 @@ for (const scenario of cases) it.each([false, true])(`${scenario.name}: HTTP pub
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); runtime.dispose(); db.close(); await rm(root, { recursive: true, force: true }); }
 });
 
-it('HTTP owner republish rejects a stopped alias if the old CLI returns binding_pending', async () => {
+it('HTTP owner plain republish of a stopped link is refused before uploading (OPEND-3510)', async () => {
   const root = await mkdtemp(join(tmpdir(), 'od-resume-http-'));
   const db = new Database(':memory:');
   migratePublicFilePublications(db); migrateCommentRelayOutbox(db);
@@ -155,11 +156,14 @@ it('HTTP owner republish rejects a stopped alias if the old CLI returns binding_
     const revision = store.getRevision(scope);
     const start = options.commands.length;
     const response = await fetch(url, { method: 'POST' });
-    expect(response.status).toBe(502);
-    expect(await response.json()).toEqual({ error: 'PUBLIC_FILE_PUBLISH_UNAVAILABLE', failure: { stage: 'snapshot', reason: 'unknown' } });
-    expect(options.commands.slice(start).map(args => args.slice(0, 2))).toEqual([['resource', 'push'], ['share', 'publish']]);
+    // Vela refuses a plain publish to a stopped binding (409
+    // share_binding_stopped). Say so before spending an upload; reopening the
+    // original link is the explicit `{ mode: 'resume' }` request.
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: 'SHARE_STOPPED_RESUME_REQUIRED' });
+    expect(options.commands.slice(start)).toEqual([]);
     expect(store.getRevision(scope)).toEqual(revision);
-    expect(uploads).toBe(2);
+    expect(uploads).toBe(1);
     expect((await fixture.readProjectShareState!(scope)).publications[0]).toMatchObject({ status: 'stopped', slug: fixtureShareSlug });
     expect(createShareBindingOutbox(db).list()).toEqual([]);
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); runtime.dispose(); db.close(); await rm(root, { recursive: true, force: true }); }
@@ -338,6 +342,48 @@ it('S9-R: explicit stopped-link resume returns the original receipt without uplo
     server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
     runtime.dispose(); db.close(); await rm(root, { recursive: true, force: true });
   }
+});
+
+it('OPEND-3517: a resumed link still detects later file edits instead of reporting unknown freshness', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'od-resume-freshness-'));
+  const db = new Database(':memory:');
+  migratePublicFilePublications(db); migrateCommentRelayOutbox(db);
+  const store = createSqlitePublicFilePublicationStore(db);
+  const fingerprints = createShareContentFingerprints(db, store);
+  const context: WorkspaceCollabContext = {
+    workspaceId: 'w', workspaceMemberId: 'owner', workspaceType: 'personal', role: 'owner',
+    memberStatus: 'active', lifecycleState: 'active', billingState: 'active', planId: null, providerMode: 'platform_credits',
+    seatSummary: buildWorkspaceSeatSummary({ seatLimit: 1, usedSeats: 1 }), permissions: buildWorkspacePermissions({ role: 'owner', lifecycleState: 'active' }),
+  };
+  const runtime = createCollabRuntime({ workspaceContext: { current: async () => context } });
+  let uploads = 0;
+  const fixture = createPublicSharePublishingFixture(db, store, async () => JSON.stringify({ id: `version-${++uploads}`, version: uploads }), undefined,
+    { commands: [], failResume: false, failResumeAfterActivation: false, failComplete: false, failStop: false });
+  const app = express(); app.use(express.json());
+  registerCollabSyncRoutes(app, { collab: runtime, publicFilePublicationStore: store, ...fixture,
+    shareContentFingerprints: fingerprints,
+    verifyWorkspaceRequest: async () => context,
+    resolveSharedProject: async projectId => ({ projectId, ownerMemberId: 'owner', sharedAt: new Date(1).toISOString() }),
+    resolveProjectDir: () => root,
+  });
+  const server = createServer(app);
+  try {
+    await writeFile(join(root, 'index.html'), '<h1>Original version</h1>');
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address(); if (!address || typeof address === 'string') throw new Error('no listener');
+    const url = `http://127.0.0.1:${address.port}/api/projects/p/files/index.html/publish-public`;
+    const json = { 'content-type': 'application/json' };
+    const freshness = async () => ((await (await fetch(url)).json()) as { freshness?: string }).freshness;
+    expect((await fetch(url, { method: 'POST' })).status).toBe(200);
+    expect(await freshness()).toBe('current');
+    expect((await fetch(url, { method: 'DELETE', headers: json, body: JSON.stringify({ slug: fixtureShareSlug }) })).status).toBe(200);
+    expect((await fetch(url, { method: 'POST', headers: json, body: JSON.stringify({ mode: 'resume' }) })).status).toBe(200);
+    // Resume reopens the bytes the last confirmed publish fingerprinted.
+    expect(await freshness()).toBe('current');
+    await writeFile(join(root, 'index.html'), '<h1>Edited after resume</h1>');
+    expect(await freshness()).toBe('outdated');
+    expect(uploads).toBe(1);
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); runtime.dispose(); db.close(); await rm(root, { recursive: true, force: true }); }
 });
 
 it('migrates legacy required URL without losing revision, then retains a no-URL publication', () => {

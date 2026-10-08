@@ -1463,6 +1463,18 @@ export function registerCollabSyncRoutes(
             } });
           }
         }
+        // Resume reopens Vela's saved version of this alias, i.e. the bytes the
+        // last confirmed publish fingerprinted. Carry that evidence to the new
+        // local revision so later edits read as outdated, not unknown
+        // (OPEND-3517). Advisory only: failure leaves the resumed link intact.
+        if (deps.shareContentFingerprints) {
+          try {
+            const revision = publicFilePublicationStore.getRevision(scope);
+            if (revision?.slug === stopped.slug) deps.shareContentFingerprints.rebind(scope, revision);
+          } catch {
+            console.warn('[od] public file content fingerprint unavailable');
+          }
+        }
         return res.json(sharePublishResponse(outcome,
           presentPublicShareLink(deps.resolvePublicShareLink, projectId, stopped.slug, amrLink)));
       } catch {
@@ -1554,6 +1566,12 @@ export function registerCollabSyncRoutes(
     if (resumed) {
       return res.json(withVisibility(sharePublishResponse(resumed,
         presentPublicShareLink(deps.resolvePublicShareLink, projectId, resumed.receipt.slug, resumed.amrLink ?? null))));
+    }
+    // Vela refuses a plain publish to a stopped binding (409
+    // share_binding_stopped). Refuse before uploading; reopening the original
+    // link is the explicit `{ mode: 'resume' }` request (OPEND-3510).
+    if (stoppedSlug) {
+      return res.status(409).json(withVisibility({ error: 'SHARE_STOPPED_RESUME_REQUIRED' }));
     }
     const resourceId = publicFileResourceIdFor(scope);
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'od-public-file-'));

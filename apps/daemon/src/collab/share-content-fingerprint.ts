@@ -29,6 +29,10 @@ export function fingerprintSharePayload(files: readonly PayloadFile[] | null): s
  */
 export interface ShareContentFingerprints {
   remember(scope: PublicFilePublicationScope, expected: PublicFilePublicationRevision, files: readonly PayloadFile[]): boolean;
+  /** Carry the stored fingerprint to a new local revision of the SAME alias.
+   * Only valid when that revision reopens the exact bytes the fingerprint
+   * already describes (stop → resume reopens Vela's saved version). */
+  rebind(scope: PublicFilePublicationScope, expected: PublicFilePublicationRevision): boolean;
   compare(scope: PublicFilePublicationScope, files: readonly PayloadFile[] | null): ShareContentFreshness;
 }
 export function createShareContentFingerprints(db: Database.Database, publications: Pick<PublicFilePublicationStore, 'getRevision'>): ShareContentFingerprints {
@@ -40,6 +44,8 @@ export function createShareContentFingerprints(db: Database.Database, publicatio
   const values = (scope: PublicFilePublicationScope) => [scope.resourceTeamId, scope.ownerMemberId, scope.projectId, scope.filePath];
   const get = db.prepare(`SELECT slug, revision, fingerprint FROM share_content_fingerprints
     WHERE resource_team_id=? AND owner_member_id=? AND project_id=? AND file_path=?`);
+  const rebindRevision = db.prepare(`UPDATE share_content_fingerprints SET revision=?
+    WHERE resource_team_id=? AND owner_member_id=? AND project_id=? AND file_path=? AND slug=?`);
   const put = db.prepare(`INSERT INTO share_content_fingerprints VALUES(?,?,?,?,?,?,?)
     ON CONFLICT(resource_team_id,owner_member_id,project_id,file_path) DO UPDATE SET
     slug=excluded.slug,revision=excluded.revision,fingerprint=excluded.fingerprint`);
@@ -53,6 +59,11 @@ export function createShareContentFingerprints(db: Database.Database, publicatio
       if (old?.revision === expected.token && old.fingerprint !== fingerprint) return false;
       put.run(...values(scope), expected.slug, expected.token, fingerprint);
       return true;
+    }),
+    rebind: db.transaction((scope: PublicFilePublicationScope, expected: PublicFilePublicationRevision): boolean => {
+      const witness = publications.getRevision(scope);
+      if (!expected.token.trim() || witness?.slug !== expected.slug || witness.token !== expected.token) return false;
+      return rebindRevision.run(expected.token, ...values(scope), expected.slug).changes === 1;
     }),
     compare(scope: PublicFilePublicationScope, files: readonly PayloadFile[] | null): ShareContentFreshness {
       try {
