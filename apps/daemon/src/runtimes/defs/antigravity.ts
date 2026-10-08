@@ -14,27 +14,36 @@ import type { RuntimeAgentDef } from '../types.js';
 
 const ANTIGRAVITY_SKIP_PERMISSIONS_FLAG = '--dangerously-skip-permissions';
 
-// `-p` requires a non-empty value, but the composed OD prompt cannot be that
-// value: on Windows it routinely exceeds CreateProcess's 32_767-char command
-// line and the spawn dies with `ENAMETOOLONG` before agy starts (OPEND-3495).
-// agy reads a piped stdin in print mode and treats it as the prompt body
-// alongside the `-p` value (verified on agy 1.3.1: a 52 KB stdin prompt whose
-// last line held the real instruction was followed, while the log reported
-// `promptLength=42` for the flag value). So argv carries only this short,
-// prompt-independent pointer and the daemon streams the real prompt on stdin.
-// Note `-p -` is NOT a stdin sentinel — agy treats it as the literal prompt
-// "-" (#7161).
-export const ANTIGRAVITY_STDIN_PROMPT_POINTER =
-  'Follow the instructions provided on stdin.';
+// Headless runs use agy's documented stdin channel (agy >= 1.1.15):
+//   agy --input-format stream-json --output-format stream-json
+// with the prompt written to stdin as one NDJSON `user` message. The prompt
+// must never ride argv: on Windows the composed OD prompt routinely exceeds
+// CreateProcess's 32_767-char command line and the spawn dies with
+// `ENAMETOOLONG` before agy starts (OPEND-3495). And agy has no other way to
+// read stdin — with `-p <text>` it ignores stdin entirely (agy 1.1.1: "no
+// longer reading stdin when a prompt is provided via a flag"), while `-p -`
+// is the literal prompt "-" (#7161). Every stream-json message runs one turn;
+// the daemon hands the frame over as a complete file-backed stdin, so agy
+// sees EOF after it and ends the session once the turn finishes.
+const ANTIGRAVITY_STREAM_JSON_ARGS = [
+  '--input-format',
+  'stream-json',
+  '--output-format',
+  'stream-json',
+] as const;
+
+export function encodeAntigravityStdinPrompt(prompt: string): string {
+  return `${JSON.stringify({ event: 'user', message: { content: prompt } })}\n`;
+}
 
 // `agy` v1.0.3 still has no `--model` flag (upstream issue #35), but the
 // TUI's Switch-Model picker writes the choice to its settings.json, and
-// every `agy -p` invocation re-reads that file on startup — verified by
+// every headless `agy` invocation re-reads that file on startup — verified by
 // capturing the `--log-file` line `Propagating selected model override to
 // backend: label="<model>"`. So we can route OD's model picker through
 // settings.json: when the user picks a concrete model in Settings, the
 // daemon writes the label into agy's settings.json right before spawn,
-// and the resulting print-mode run uses that model.
+// and the resulting headless run uses that model.
 //
 // Two ids the picker exposes are special:
 //   - 'default'         : leave settings.json untouched, so agy keeps
@@ -47,7 +56,7 @@ export const ANTIGRAVITY_STDIN_PROMPT_POINTER =
 //
 // `supportsCustomModel: false` because the label set is a server-side
 // enum — a typed id agy doesn't recognise resolves to a silent
-// `availableModels` cache miss + empty print-mode output, which surfaces
+// `availableModels` cache miss + empty headless output, which surfaces
 // to the user as a generic "empty response" error.
 //
 // The 8 model labels mirror what `Switch Model` in agy's TUI lists for
@@ -214,14 +223,12 @@ export const antigravityAgentDef = {
   // we got an identical byte-for-byte form re-emission on turn 2 when
   // turn 1's tool-call retry path returned the cached form response.
   //
-  // Instead we treat agy as a stateless plain adapter like qwen /
+  // Instead we treat agy as a stateless adapter like qwen /
   // deepseek: every spawn gets the full OD-rendered transcript via
   // `buildDaemonTranscript`, and that transcript's prior assistant
   // turns are sanitized to strip `<question-form>` markup + form-schema
   // JSON fences (see `sanitizePriorAssistantTurnForTranscript` in
-  // apps/web/src/providers/daemon.ts). The stronger OVERRIDE block
-  // composed in server.ts gives a second line of defense for weak
-  // plain-stream models like Gemini 3.5 Flash.
+  // apps/web/src/providers/daemon.ts).
   buildArgs: (
     _prompt,
     _imagePaths,
@@ -235,31 +242,28 @@ export const antigravityAgentDef = {
         runtimeContext.antigravitySettingsPath,
       );
     }
-    // Print mode via `-p <pointer>` with the real prompt on stdin — see
-    // ANTIGRAVITY_STDIN_PROMPT_POINTER for why the prompt must stay out of
-    // argv.
     const args: string[] = [];
-    // Always opt into `--log-file` when the daemon supplied a path so
-    // it can post-exit grep for the actual upstream failure shape
-    // (auth missing vs quota reached vs upstream error) — without it
-    // the chat surfaces a generic "empty response" because print mode
-    // never echoes those errors on stdout. See server.ts empty-output
-    // guard for the consumer.
+    // Always opt into `--log-file` when the daemon supplied a path: the
+    // model lock in server.ts waits for agy to log the settings.json model
+    // override there, and the connection test folds its tail into auth /
+    // quota classification.
     //
-    // Flag order is load-bearing on agy: put `--log-file` before `-p`
-    // so diagnostics (model override / auth / quota) land in the log.
+    // Flag order is load-bearing on agy: put `--log-file` first so
+    // diagnostics (model override / auth / quota) land in the log.
     if (runtimeContext.agentLogFilePath) {
       args.push('--log-file', runtimeContext.agentLogFilePath);
     }
-    // Daemon-managed print-mode runs have no interactive approval channel.
+    // Daemon-managed headless runs have no interactive approval channel.
     if (agentCapabilities.get('antigravity')?.skipPermissions) {
       args.push(ANTIGRAVITY_SKIP_PERMISSIONS_FLAG);
     }
-    args.push('-p', ANTIGRAVITY_STDIN_PROMPT_POINTER);
+    args.push(...ANTIGRAVITY_STREAM_JSON_ARGS);
     return args;
   },
   promptViaStdin: true,
-  streamFormat: 'plain',
+  encodeStdinPrompt: encodeAntigravityStdinPrompt,
+  streamFormat: 'json-event-stream',
+  eventParser: 'antigravity',
   installUrl: 'https://antigravity.google/cli',
   docsUrl: 'https://antigravity.google/docs/cli-overview',
 } satisfies RuntimeAgentDef;
