@@ -108,7 +108,7 @@ describe("workspace product boundary", () => {
     writeFileSync(join(f.root, "apps/daemon/dist/previous.js"), "previous");
     const real = (await vi.importActual<typeof import("node:fs")>("node:fs")).renameSync;
     vi.mocked(renameSync).mockImplementation((from, to) => {
-      if (String(from).includes("/tree/")) throw new Error("replacement refused");
+      if (String(from).replaceAll("\\", "/").includes("/tree/")) throw new Error("replacement refused");
       return real(from, to);
     });
     await expect(importWorkspaceOutputs(f.root, f.scratch, descriptor)).rejects.toThrow("replacement refused");
