@@ -2256,7 +2256,7 @@ describe('collab sync routes', () => {
       ...await publicShareFixture(),
       resolveProjectDir: () => dir,
       resolveSharedProject: async () => null,
-      shareContentFingerprints: { remember, compare: () => 'unknown' },
+      shareContentFingerprints: { remember, rebind: vi.fn(() => false), compare: () => 'unknown' },
     });
 
     const publish = await api.json('/api/projects/p1/files/index.html/publish-public', {

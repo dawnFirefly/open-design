@@ -373,14 +373,15 @@ it('OPEND-3517: a resumed link still detects later file edits instead of reporti
     const address = server.address(); if (!address || typeof address === 'string') throw new Error('no listener');
     const url = `http://127.0.0.1:${address.port}/api/projects/p/files/index.html/publish-public`;
     const json = { 'content-type': 'application/json' };
+    const freshness = async () => ((await (await fetch(url)).json()) as { freshness?: string }).freshness;
     expect((await fetch(url, { method: 'POST' })).status).toBe(200);
-    expect((await (await fetch(url)).json()).freshness).toBe('current');
+    expect(await freshness()).toBe('current');
     expect((await fetch(url, { method: 'DELETE', headers: json, body: JSON.stringify({ slug: fixtureShareSlug }) })).status).toBe(200);
     expect((await fetch(url, { method: 'POST', headers: json, body: JSON.stringify({ mode: 'resume' }) })).status).toBe(200);
     // Resume reopens the bytes the last confirmed publish fingerprinted.
-    expect((await (await fetch(url)).json()).freshness).toBe('current');
+    expect(await freshness()).toBe('current');
     await writeFile(join(root, 'index.html'), '<h1>Edited after resume</h1>');
-    expect((await (await fetch(url)).json()).freshness).toBe('outdated');
+    expect(await freshness()).toBe('outdated');
     expect(uploads).toBe(1);
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); runtime.dispose(); db.close(); await rm(root, { recursive: true, force: true }); }
 });

@@ -111,7 +111,10 @@ describe('runVelaCommand', () => {
       ['presence', 'heartbeat', 'p1', '--client-id', 'm1', '--display-name', '张 三',
         '--activity-json', '{"file":"secret-plan.html"}'],
       { env: { VELA_BIN: process.execPath, OD_DATA_DIR: '' } },
-    ).catch((error: unknown) => error as Error & { cmd?: string });
+    ).then(
+      () => { throw new Error('expected the command to reject'); },
+      (error: unknown) => error as Error & { cmd?: string },
+    );
     expect(rejection).toBe(failure);
     for (const text of [rejection.message, rejection.cmd ?? '']) {
       expect(text).not.toContain('张 三');
