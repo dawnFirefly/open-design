@@ -5928,11 +5928,11 @@ export async function startServer({
         throw error;
       }
     },
-    onAccessRevoked: ({ workspaceId }) => {
-      workspaceDirectoryAuthority.invalidate('auth_reject');
-      workspaceExactAuthorityCache.invalidate(workspaceId);
-      workspaceExactContextCache.invalidate(workspaceId, 'auth_reject');
-    },
+    // No onAccessRevoked hook on purpose (OPEND-3553): billing is
+    // display-only, and Vela also answers internal billing failures with 403.
+    // A rejected billing projection only marks this runtime entry; membership
+    // revocation is owned by the workspace directory and the hub
+    // `workspace-access-revoked` event, never by a billing response.
     onStateChange: (state) => {
       // The request that created a runtime already receives this state in its
       // response. Background catch-up/retry/poll completion needs a thin nudge
