@@ -885,10 +885,19 @@ export function TestCampaignModal({
 	observeTestRuntimeIdentity(authenticated, owner, locale);
 	const retained = retainedTestValue(owner, locale);
 	const remountValue = useRef(retained);
+	// Directory and runtime failures pause the whole Test loading chain. Each
+	// successful recovery clears only the failure owned by that request chain.
+	const requests = useRef({ scope: JSON.stringify([owner, locale]), catalog: false, runtime: false });
+	const scope = JSON.stringify([owner, locale]);
+	if (requests.current.scope !== scope) requests.current = { scope, catalog: false, runtime: false };
+	const pauseAutomaticRequests = useCallback(() => requests.current.catalog || requests.current.runtime, []);
+	const catalogResult = useCallback((failed: boolean) => { requests.current.catalog = failed; }, []);
 	const selectedRef = useRef<TestDeployment | null>(retained?.deployment ?? null);
 	const selectionChanged = useCallback((selected: TestDeployment | null) => {
-		if (!selected || (selectedRef.current && !sameTestDeployment(selectedRef.current, selected)))
+		if (!selected || (selectedRef.current && !sameTestDeployment(selectedRef.current, selected))) {
 			invalidateRetainedTestRuntime();
+			requests.current.runtime = false;
+		}
 	}, []);
 	const [showControls] = useState(
 		() =>
@@ -905,6 +914,8 @@ export function TestCampaignModal({
 		manual: showControls,
 		initialSelection: retained?.deployment,
 		onSelection: selectionChanged,
+		pauseAutomaticRequests,
+		onRequestResult: catalogResult,
 	});
 	selectedRef.current = deployment;
 	const publishedSession = useRef<TestRuntimeSession | null>(null);
@@ -1001,14 +1012,14 @@ export function TestCampaignModal({
 			active ??= inheritedEpoch === retainedTestEpoch ? inherited : null;
 			const started = testClock();
 			const current = () => !signal.aborted;
-			if (!placements.length) return { kind: "clear" };
+			if (!placements.length) { requests.current.runtime = false; return { kind: "clear" }; }
 			// A held context must not add a turn before the placement requests start.
 			let selectedContext: TestContext;
 			if (context) selectedContext = context;
 			else {
 				const acquired = await acquireContext(signal);
 				if (!current()) return { kind: "retain" };
-				if (!acquired) return { kind: "clear" };
+				if (!acquired) { requests.current.runtime = false; return { kind: "clear" }; }
 				selectedContext = acquired;
 			}
 			/**
@@ -1180,11 +1191,15 @@ export function TestCampaignModal({
 				if (context === selectedContext) context = null;
 				const refreshed = context ?? (await acquireContext(signal));
 				if (!current()) return { kind: "retain" };
-				if (!refreshed) return { kind: "clear" };
+				if (!refreshed) { requests.current.runtime = false; return { kind: "clear" }; }
 				selectedContext = refreshed;
 				settled = await loadPlacements(selectedContext);
 				if (!current()) return { kind: "retain" };
 			}
+			// A wholly failed round enters request recovery. A partial placement
+			// failure remains isolated: live sibling answers still renew normally
+			// (OPEND-3298), and a held failed grant keeps its own original deadline.
+			requests.current.runtime = settled.length > 0 && settled.every(result => result.status === "rejected");
 			// Record every fresh answer, then let a placement that is on screen but
 			// merely slow present its last answer again. Only that placement is
 			// held back, and only within the authority its answer granted: its
@@ -1314,7 +1329,10 @@ export function TestCampaignModal({
 				else if (result.kind === "clear" || result.kind === "waiting") invalidateRetainedTestRuntime();
 				return result;
 			} catch (error) {
-				if (!signal.aborted && epoch === retainedTestEpoch && touchpointWithdrawsDisplay(error)) invalidateRetainedTestRuntime();
+				if (!signal.aborted && epoch === retainedTestEpoch) {
+					requests.current.runtime = true;
+					if (touchpointWithdrawsDisplay(error)) invalidateRetainedTestRuntime();
+				}
 				throw error;
 			}
 		},
@@ -1324,7 +1342,12 @@ export function TestCampaignModal({
 		enabled: compatible && adapter !== null,
 		identity: adapter ? owner + ":" + adapter.selectionKey : null,
 		load,
-		onError: (error) => emitWebTouchpointDiagnostic(testLoadDiagnostic(error)),
+		stopOnFailure: true,
+		pauseAutomaticRequests,
+		onError: (error) => {
+			requests.current.runtime = true;
+			emitWebTouchpointDiagnostic(testLoadDiagnostic(error));
+		},
 	});
 	// Only the grant this route mount inherited may fill its initial load gap.
 	// Once a server answer replaces it, the lifecycle owns normal revalidation.
@@ -1361,7 +1384,7 @@ export function TestCampaignModal({
 		if (!Number.isFinite(nextExpiry)) return;
 		const timer = setTimeout(() => expirePlacement((tick) => tick + 1), nextExpiry);
 		return () => clearTimeout(timer);
-	}, [currentValue, nextExpiry]);
+	}, [currentValue, nextExpiry, liveKey]);
 	// Publish a new session only when the lease or its live placements change.
 	const runtimeSession = useMemo(() => {
 		const current = currentValue;

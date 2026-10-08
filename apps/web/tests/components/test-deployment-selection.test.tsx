@@ -162,6 +162,8 @@ describe("Test deployment directory discovery", () => {
 			expect(emitWebTouchpointDiagnostic).toHaveBeenCalled();
 			fetch.mockImplementation(async () => response());
 			await advance(30_000);
+			expect(result.current.selected).toBe(selected);
+			await event("online");
 			expect(result.current.selected).toBeNull();
 		},
 	);

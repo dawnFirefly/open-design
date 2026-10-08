@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { emitWebTouchpointDiagnostic } from "./touchpoint-component";
-import { RETRY_BACKOFF_MS } from "./touchpoint-lifecycle";
 import type { TouchpointStaticAction } from "./touchpoint-static-actions";
 
 export const TEST_CAMPAIGN_PLACEMENTS = [
@@ -126,6 +125,8 @@ export function useTestDeploymentSelection({
 	manual,
 	initialSelection = null,
 	onSelection,
+	pauseAutomaticRequests,
+	onRequestResult,
 }: {
 	enabled: boolean;
 	owner: string | null;
@@ -133,6 +134,9 @@ export function useTestDeploymentSelection({
 	/** An already-authorized in-process selection, never an offline directory grant. */
 	initialSelection?: TestDeployment | null;
 	onSelection?: (selected: TestDeployment | null) => void;
+	pauseAutomaticRequests?: () => boolean;
+	/** Only a completed directory read clears its own failure state. */
+	onRequestResult?: (failed: boolean) => void;
 }) {
 	const [state, setState] = useState<SelectionState>({
 		owner,
@@ -151,24 +155,18 @@ export function useTestDeploymentSelection({
 		let disposed = false;
 		let request: AbortController | null = null;
 		let timeout: ReturnType<typeof setTimeout> | undefined;
-		let retry: ReturnType<typeof setTimeout> | undefined;
-		let retryIndex = 0;
+		let failed = false;
 		const cancel = () => {
 			request?.abort();
 			request = null;
 			clearTimeout(timeout);
-			clearTimeout(retry);
 		};
-		// A failed read on a fresh home mount must not leave the entry blank until the next poll.
-		const retrySoon = () => {
-			const delay = RETRY_BACKOFF_MS[retryIndex];
-			if (disposed || delay === undefined || navigator.onLine === false) return;
-			retryIndex += 1;
-			clearTimeout(retry);
-			retry = setTimeout(() => void refresh(), delay);
+		const pause = () => {
+			failed = true;
+			onRequestResult?.(true);
 		};
 		const refresh = async () => {
-			if (disposed || request || document.hidden) return;
+			if (disposed || request || document.hidden || navigator.onLine === false) return;
 			const controller = new AbortController();
 			request = controller;
 			const current = () =>
@@ -179,7 +177,7 @@ export function useTestDeploymentSelection({
 				emitWebTouchpointDiagnostic({
 					code: "touchpoint_test_catalog_timeout",
 				});
-				retrySoon();
+				pause();
 			}, REQUEST_TIMEOUT_MS);
 			try {
 				const response = await fetch("/api/touchpoints/test-runtime/deployments", {
@@ -197,7 +195,8 @@ export function useTestDeploymentSelection({
 				}
 				const deployments = readDirectory(await response.json());
 				if (!current()) return;
-				retryIndex = 0;
+				failed = false;
+				onRequestResult?.(false);
 				{
 					const previous = stateRef.current;
 					const old =
@@ -231,7 +230,7 @@ export function useTestDeploymentSelection({
 								? error.message
 								: "touchpoint_test_catalog_failed",
 					});
-					retrySoon();
+					pause();
 				}
 			} finally {
 				if (request === controller) {
@@ -248,7 +247,11 @@ export function useTestDeploymentSelection({
 			else wake();
 		};
 		void refresh();
-		const interval = setInterval(() => void refresh(), POLL_MS);
+		// OPEND-3436: a failed catalog or runtime round waits for one recovery
+		// event. A successful empty directory still uses normal discovery polling.
+		const interval = setInterval(() => {
+			if (!failed && !pauseAutomaticRequests?.()) void refresh();
+		}, POLL_MS);
 		window.addEventListener("focus", wake);
 		window.addEventListener("online", wake);
 		window.addEventListener("pageshow", wake);
@@ -264,7 +267,7 @@ export function useTestDeploymentSelection({
 			window.removeEventListener("offline", cancel);
 			document.removeEventListener("visibilitychange", visibility);
 		};
-	}, [enabled, owner, manual, onSelection]);
+	}, [enabled, owner, manual, onSelection, pauseAutomaticRequests, onRequestResult]);
 
 	const select = useCallback(
 		(id: string) => {

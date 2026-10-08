@@ -504,7 +504,7 @@ describe("OPEND-3311 return-home timing", () => {
     }
   });
 
-  it("recovers a still-eligible Test entry promptly after one failed remount catalog read", async () => {
+  it("keeps a still-authorized Test entry after failed remount discovery and recovers once on focus", async () => {
     const view = await start();
     expect(visibleEntry()).toBe(true);
     view.rerender(<Home home={false} />);
@@ -514,23 +514,25 @@ describe("OPEND-3311 return-home timing", () => {
     view.rerender(<Home />);
     await settle(999);
     expect(catalogs).toBe(1);
-    // Ticket says timely, with no numeric SLA. Five seconds is the explicit repro threshold;
-    // before the fix the entry stayed blank until the 30-second poll.
     await settle(4_001);
+    expect(catalogs).toBe(1);
+    expect(visibleEntry()).toBe(true);
+    act(() => window.dispatchEvent(new Event("focus")));
+    await settle(32);
     expect(catalogs).toBe(2);
     expect(visibleEntry()).toBe(true);
   });
 
-  it("bounds the short catalog retries and falls back to the regular poll", async () => {
+  it("stops catalog retries and polling after a failed remount discovery", async () => {
     const view = await start();
     view.rerender(<Home home={false} />);
     await settle(100);
     let catalogs = 0;
     catalogReply = () => { catalogs += 1; return new Response(null, { status: 500 }); };
     view.rerender(<Home />);
-    await settle(29_000);
-    // One remount read plus the 1s and 3s retries; nothing more until the 30s poll.
-    expect(catalogs).toBe(3);
+    await settle(120_000);
+    expect(catalogs).toBe(1);
+    expect(visibleEntry()).toBe(false);
   });
 
   it("focus wakes failed catalog discovery immediately instead of waiting for its poll", async () => {

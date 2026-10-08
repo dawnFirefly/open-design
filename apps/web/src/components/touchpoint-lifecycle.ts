@@ -226,14 +226,14 @@ export type TouchpointLifecycleOptions<T> = Readonly<{
 	 * was not reached suspends the poll and the backoff chain, and recovery
 	 * becomes one deduplicated revalidation per user-visible event.
 	 *
-	 * Off by default, and that default is load-bearing rather than cautious. The
-	 * Test channel is an operator watching a schedule they are editing; its
-	 * whole job is to keep asking, its authorization is capped at sixty seconds,
-	 * and there is no cached content behind it to fall back ON. Only the three
-	 * production placements, whose daemon holds a package and a schedule, have
-	 * anything to gain by going quiet.
+	 * Production also holds through the cached schedule and probes every five
+	 * minutes. Test stops failed requests separately, without either behavior.
 	 */
 	offlineFallback?: boolean;
+	/** Stop failed Test loads until a recovery event, without extending authority. */
+	stopOnFailure?: boolean;
+	/** A sibling request chain can pause automatic requests for the same campaign. */
+	pauseAutomaticRequests?: () => boolean;
 }>;
 
 type Clock = { monotonic: number; wall: number };
@@ -421,7 +421,7 @@ const holdThroughSchedule = <L extends { validForMs: number; offlineValidForMs?:
  * server-relative authority, never a client activation time. Renewing the same
  * immutable decision keeps its mount identity while replacing its lease.
  */
-export function useTouchpointLifecycle<T>({ enabled, identity, load, onError, offlineFallback = false }: TouchpointLifecycleOptions<T>) {
+export function useTouchpointLifecycle<T>({ enabled, identity, load, onError, offlineFallback = false, stopOnFailure = false, pauseAutomaticRequests }: TouchpointLifecycleOptions<T>) {
 	const [state, setState] = useState<{ identity: string | null; current: T | null; generation: number; status: LifecycleStatus }>({ identity: null, current: null, generation: 0, status: null });
 	const generation = useRef(0);
 	const lease = useRef<{ identity: string; key: string; value: T; generation: number; start: Clock; validForMs: number; offlineValidForMs?: number } | null>(null);
@@ -443,8 +443,8 @@ export function useTouchpointLifecycle<T>({ enabled, identity, load, onError, of
 	 * did finish mounting never reports, so it is never rebuilt.
 	 */
 	const fencedMount = useRef<number | null>(null);
-	const inputs = useRef({ enabled, identity, onError });
-	inputs.current = { enabled, identity, onError };
+	const inputs = useRef({ enabled, identity, onError, pauseAutomaticRequests });
+	inputs.current = { enabled, identity, onError, pauseAutomaticRequests };
 	const clearRef = useRef<() => void>(() => {});
 	const clear = useCallback(() => clearRef.current(), []);
 	const isCurrent = useCallback((expected: number) => {
@@ -573,6 +573,7 @@ export function useTouchpointLifecycle<T>({ enabled, identity, load, onError, of
 		 */
 		const abandonAttempt = (error: unknown) => {
 			cancelRequest();
+			if (stopOnFailure) offline = true;
 			// Judge the lease that is still recoverable — the active one, or the
 			// one `wake` set aside — by its OWN window. Asking whether there is an
 			// ACTIVE lease and calling "none" expired is what made a single
@@ -618,6 +619,7 @@ export function useTouchpointLifecycle<T>({ enabled, identity, load, onError, of
 				// answer at all for "there is no network", where every attempt in
 				// the chain fails the same way for the same reason.
 				!offline &&
+				!inputs.current.pauseAutomaticRequests?.() &&
 				!touchpointWithdrawsDisplay(error) &&
 				retryIndex < RETRY_BACKOFF_MS.length &&
 				delay + REQUEST_TIMEOUT_MS <= remainingInCycle
@@ -645,7 +647,7 @@ export function useTouchpointLifecycle<T>({ enabled, identity, load, onError, of
 					// is holding, and it does not wait for a network that may never
 					// come back. One request at a boundary is not a retry chain — the
 					// lease it belonged to is gone, so there is no second boundary.
-					if (offline) revalidateOnce();
+					if (offlineFallback && offline) revalidateOnce();
 				} else expiryTimer = setTimeout(tick, Math.min(remaining, MAX_TIMER_MS));
 			};
 			tick();
@@ -656,7 +658,7 @@ export function useTouchpointLifecycle<T>({ enabled, identity, load, onError, of
 		 * exhaust its retries would leave every later cycle with none.
 		 */
 		const refresh = async (retrying = false) => {
-			if (stopped || ended || request || document.hidden) return;
+			if (stopped || ended || request || document.hidden || (stopOnFailure && browserReportsOffline())) return;
 			if (!retrying) {
 				retryIndex = 0;
 				cycleStart = clock();
@@ -828,7 +830,7 @@ export function useTouchpointLifecycle<T>({ enabled, identity, load, onError, of
 			const live = current !== null && elapsed(current.start) < current.validForMs;
 			// Known offline: a return to the page may still retire a lapsed lease,
 			// but it may not ask (OPEND-3436 AC3). `online` is what asks next.
-			if (offlineFallback && browserReportsOffline()) {
+			if ((offlineFallback || stopOnFailure) && browserReportsOffline()) {
 				if (current && !live) {
 					// Set aside exactly as `wake` would, unless fallback already
 					// reclaimed it — see the `offline` branch below.
@@ -837,7 +839,7 @@ export function useTouchpointLifecycle<T>({ enabled, identity, load, onError, of
 				}
 				return;
 			}
-			if (offline) {
+			if (offline || inputs.current.pauseAutomaticRequests?.()) {
 				// A device that slept past the end of an activity comes back with
 				// `armExpiry`'s timer still PENDING — sleep stops the timer queue
 				// while the wall clock runs on — so the lease it was going to retire
@@ -860,7 +862,7 @@ export function useTouchpointLifecycle<T>({ enabled, identity, load, onError, of
 		// A tick is a question the network cannot answer while it is down, so the
 		// interval stands down and recovery is event-driven until it is back.
 		const interval = setInterval(() => {
-			if (offline) return;
+			if (offline || inputs.current.pauseAutomaticRequests?.()) return;
 			void refresh();
 		}, POLL_MS);
 		window.addEventListener("focus", resume);
@@ -880,7 +882,7 @@ export function useTouchpointLifecycle<T>({ enabled, identity, load, onError, of
 			window.removeEventListener("offline", cancelOnOffline);
 			document.removeEventListener("visibilitychange", resume);
 		};
-	}, [enabled, identity, load, offlineFallback]);
+	}, [enabled, identity, load, offlineFallback, stopOnFailure]);
 
 	return {
 		current: enabled && state.identity === identity ? state.current : null,

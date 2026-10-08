@@ -13,8 +13,8 @@
 //   - the activity still ends on the server's own schedule, on a timer, with no
 //     network involved at all.
 //
-// The Test channel does not opt in, so every case here also has to leave its
-// retry semantics exactly where they were.
+// Callers that opt into neither request suspension nor Production fallback
+// retain the generic lifecycle's existing bounded retry behavior.
 
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";

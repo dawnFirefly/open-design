@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 // Local lifecycle regressions, not real-client acceptance. The 2026-10-02
 // ruling keeps Test's short authorization deadline and 5-minute Production
-// fallback probes; Test failure rechecks below only cover existing behavior.
+// fallback probes. Test failures stop automatic requests under OPEND-3436.
 import { createElement, StrictMode } from "react";
 import path from "node:path";
 import ts from "typescript";
@@ -329,13 +329,13 @@ describe("OPEND-3436 Test channel", () => {
     expect(probe.result.current?.decisions.size).toBe(4);
     expect(probe.result.current?.isAuthorized()).toBe(true);
   });
-  it("AC3/10 Test continues normal rechecks after failure without extending expired display authority", async () => {
+  it("AC3/10 Test stops automatic rechecks after failure without extending expired display authority", async () => {
     const { fetchMock, probe, fail, recover } = setupTest(); await step();
     expect(probe.result.current?.decisions.size).toBe(4);
     fail(); await step(30_000);
     const calls = fetchMock.mock.calls.length;
     await step(120_000);
-    expect(fetchMock.mock.calls.length).toBeGreaterThan(calls);
+    expect(fetchMock.mock.calls.length).toBe(calls);
     expect(probe.result.current?.decisions.size ?? 0).toBe(0);
     expect(probe.result.current?.isAuthorized() ?? false).toBe(false);
     recover(); wake("online"); await step();
@@ -364,15 +364,16 @@ describe("OPEND-3436 Test channel", () => {
     expect(probe.result.current?.decisions.size ?? 0).toBe(0);
     expect(probe.result.current?.isAuthorized() ?? false).toBe(false);
   });
-  it("remount after twenty seconds preserves only the original forty seconds and the existing failure retry schedule", async () => {
+  it("remount after twenty seconds preserves only the original forty seconds and stops failed requests", async () => {
     const { probe, fetchMock, fail, restart } = setupTest(); await step(); await step(20_000);
     fail(); restart(); await step();
     expect(probe.result.current?.decisions.size).toBe(4);
     const requests = fetchMock.mock.calls.length;
     await step(999); expect(fetchMock.mock.calls.length).toBe(requests);
-    await step(1); expect(fetchMock.mock.calls.length).toBeGreaterThan(requests);
+    await step(1); expect(fetchMock.mock.calls.length).toBe(requests);
     await step(38_999); expect(probe.result.current?.decisions.size).toBe(4);
     await step(1); expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+    expect(fetchMock.mock.calls.length).toBe(requests);
   });
   it("restored placements independently retire at their original fifteen-second boundaries", async () => {
     const { probe, fail, restart } = setupTest([15_000, 30_000, 45_000, 60_000]); await step(); await step(10_000);
@@ -485,8 +486,8 @@ describe("OPEND-3436 Test channel", () => {
     await step(30_000); expect(probe.result.current?.decisions.size).toBe(4);
     fetchMock.mockRejectedValue(new TypeError("DNS unavailable")); restart(); await step();
     expect(probe.result.current?.decisions.size).toBe(4);
-    // A directory failure allows the successful runtime renewal at t=30s.
-    const remaining = failure.startsWith("directory") ? 60_000 : 30_000;
+    // Neither chain renews automatically after the directory/runtime failure.
+    const remaining = 30_000;
     await step(remaining - 1); expect(probe.result.current?.decisions.size).toBe(4);
     await step(1); expect(probe.result.current?.decisions.size ?? 0).toBe(0);
   });
