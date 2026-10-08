@@ -46,6 +46,7 @@ import {
 	TEST_CAMPAIGN_PLACEMENTS,
 	type TestCampaignPlacement,
 	type TestDeployment,
+	sameTestDeployment,
 	useTestDeploymentSelection,
 } from "./test-deployment-selection";
 export {
@@ -79,6 +80,23 @@ type TestPlacementAuthority = Readonly<{ received: TestClock; validForMs: number
 type TestRuntimeValue = Omit<TestRuntimeSession, "isAuthorized"> & Readonly<{
 	authorizations: ReadonlyMap<TestCampaignPlacement, TestPlacementAuthority>;
 }>;
+
+/** Only an existing short grant survives a route remount in this process. */
+let retainedTestRuntime: { owner: string; locale: string; value: TestRuntimeValue } | null = null;
+let retainedTestEpoch = 0;
+let retainedTestScope: string | null = null;
+function invalidateRetainedTestRuntime(): void {
+	retainedTestRuntime = null;
+	retainedTestEpoch += 1;
+}
+
+/** The shell observes identity even while the home-only Test hosts are absent. */
+export function observeTestRuntimeIdentity(authenticated: boolean, owner: string | null, locale: string): void {
+	const scope = supportsHost(authenticated) && owner ? JSON.stringify([owner, locale]) : null;
+	if (retainedTestScope === scope) return;
+	invalidateRetainedTestRuntime();
+	retainedTestScope = scope;
+}
 
 let currentTestSession: TestRuntimeSession | null = null;
 const testRuntimeListeners = new Set<() => void>();
@@ -123,6 +141,10 @@ export function setTestRuntimeSession(
 	for (const listener of testRuntimeListeners) listener();
 }
 export function clearTestRuntimeSession(): void {
+	invalidateRetainedTestRuntime();
+	unpublishTestRuntimeSession();
+}
+function unpublishTestRuntimeSession(): void {
 	if (!currentTestSession) return;
 	currentTestSession = null;
 	resetAcceptanceDelivery();
@@ -166,7 +188,7 @@ class TestRuntimeResponseError extends Error {
 	readonly touchpointWithdrawal: boolean;
 	constructor(code: string, status: number) {
 		super(code);
-		this.touchpointWithdrawal = status === 401 || status === 403 || status === 410;
+		this.touchpointWithdrawal = [401, 403, 410].includes(status);
 	}
 }
 
@@ -201,8 +223,28 @@ type LoadedTestPlacement = Readonly<{
 /** Elapsed time measured on both clocks, as the lifecycle measures its leases. */
 type TestClock = Readonly<{ monotonic: number; wall: number }>;
 const testClock = (): TestClock => ({ monotonic: performance.now(), wall: Date.now() });
-const testElapsed = (start: TestClock) =>
-	Math.max(0, performance.now() - start.monotonic, Date.now() - start.wall);
+const elapsedTestClocks = new WeakMap<TestClock, number>();
+const testElapsed = (start: TestClock) => {
+	const elapsed = Math.max(elapsedTestClocks.get(start) ?? 0, performance.now() - start.monotonic, Date.now() - start.wall);
+	elapsedTestClocks.set(start, elapsed);
+	return elapsed;
+};
+
+function retainedTestValue(owner: string | null, locale: string): TestRuntimeValue | null {
+	const retained = retainedTestRuntime;
+	if (!retained) return null;
+	if (retained.owner !== owner || retained.locale !== locale) {
+		invalidateRetainedTestRuntime();
+		return null;
+	}
+	if (![...retained.value.authorizations.values()].some((grant) => testElapsed(grant.received) < grant.validForMs)) {
+		// Expiry spends only this grant. A server renewal already in flight may
+		// still install a fresh grant; withdrawal and identity changes fence it.
+		retainedTestRuntime = null;
+		return null;
+	}
+	return retained.value;
+}
 
 /** A decision that disagrees with the selection, carrying both identities. */
 class TestDecisionMismatchError extends Error {
@@ -840,6 +882,14 @@ export function TestCampaignModal({
 	const { locale } = useI18n();
 	const compatible = supportsHost(authenticated);
 	const owner = sessionSubject ?? null;
+	observeTestRuntimeIdentity(authenticated, owner, locale);
+	const retained = retainedTestValue(owner, locale);
+	const remountValue = useRef(retained);
+	const selectedRef = useRef<TestDeployment | null>(retained?.deployment ?? null);
+	const selectionChanged = useCallback((selected: TestDeployment | null) => {
+		if (!selected || (selectedRef.current && !sameTestDeployment(selectedRef.current, selected)))
+			invalidateRetainedTestRuntime();
+	}, []);
 	const [showControls] = useState(
 		() =>
 			typeof window !== "undefined" &&
@@ -853,7 +903,10 @@ export function TestCampaignModal({
 		enabled: compatible,
 		owner,
 		manual: showControls,
+		initialSelection: retained?.deployment,
+		onSelection: selectionChanged,
 	});
+	selectedRef.current = deployment;
 	const publishedSession = useRef<TestRuntimeSession | null>(null);
 	useEffect(() => {
 		ensureWebTouchpointElement();
@@ -862,6 +915,10 @@ export function TestCampaignModal({
 	const adapter = useMemo(() => {
 		if (!deployment) return null;
 		const selected = deployment;
+		const inherited = retainedTestRuntime?.value === remountValue.current &&
+			remountValue.current && sameTestDeployment(remountValue.current.deployment, selected)
+			? remountValue.current : null;
+		const inheritedEpoch = retainedTestEpoch;
 		const placements = testPlacementIds(selected);
 		// A snapshot may be renewed without remounting only within the same UI language.
 		const selectionKey = JSON.stringify([
@@ -882,6 +939,16 @@ export function TestCampaignModal({
 			TestCampaignPlacement,
 			{ context: TestContext; item: LoadedTestPlacement }
 		>();
+		// A resumed visible placement is also a held presentation for renewal.
+		// Keep its original receipt and duration so a slow sibling cannot spend
+		// it early, and a route remount cannot issue it any additional time.
+		for (const [placementKey, decision] of inherited?.decisions ?? []) {
+			const authority = inherited!.authorizations.get(placementKey)!;
+			lastAuthorized.set(placementKey, { context: inherited!.context, item: {
+				placementKey, decision, received: authority.received, validForMs: authority.validForMs,
+				startsAt: Date.parse(decision.startsAt), endsAt: Date.parse(decision.endsAt), serverTime: Date.parse(decision.serverTime),
+			} });
+		}
 		/** Resolves `null` for a context response this selection cannot use. */
 		const fetchContext = async (signal: AbortSignal): Promise<TestContext | null> => {
 			const response = await fetch("/api/touchpoints/test-runtime/context", {
@@ -899,13 +966,14 @@ export function TestCampaignModal({
 					response.status,
 				);
 			const next = (await response.json()) as TestContext;
-			return next &&
+			if (!(next &&
 				next.deploymentId === selected.id &&
 				next.scenario === "realtime" &&
 				!("simulatedAt" in next) &&
-				validIso(next.updatedAt)
-				? next
-				: null;
+				validIso(next.updatedAt))) return null;
+			return inherited && next.updatedAt === inherited.context.updatedAt &&
+				next.testerMemberId === inherited.context.testerMemberId
+				? inherited.context : next;
 		};
 		/**
 		 * Single-flight: every caller that needs a context while one is being
@@ -930,6 +998,7 @@ export function TestCampaignModal({
 			signal: AbortSignal,
 			active: TestRuntimeValue | null,
 		): Promise<TouchpointLifecycleLoad<TestRuntimeValue>> => {
+			active ??= inheritedEpoch === retainedTestEpoch ? inherited : null;
 			const started = testClock();
 			const current = () => !signal.aborted;
 			if (!placements.length) return { kind: "clear" };
@@ -1213,7 +1282,7 @@ export function TestCampaignModal({
 				context: selectedContext,
 				decisions: new Map(authorized.map((item) => [
 					item.placementKey,
-					(sameContext && active.decisions.get(item.placementKey)) || item.decision,
+					(sameContext && active?.decisions.get(item.placementKey)) || item.decision,
 				])),
 				authorizations: new Map(authorized.map((item) => [item.placementKey, {
 					received: item.received, validForMs: item.validForMs,
@@ -1233,14 +1302,23 @@ export function TestCampaignModal({
 			};
 		};
 		return { selectionKey, load };
-	}, [deployment, locale]);
+	}, [deployment, locale, owner]);
 
 	const load = useCallback(
-		(signal: AbortSignal, active: TestRuntimeValue | null) =>
-			adapter
-				? adapter.load(signal, active)
-				: Promise.resolve({ kind: "clear" } as const),
-		[adapter],
+		async (signal: AbortSignal, active: TestRuntimeValue | null): Promise<TouchpointLifecycleLoad<TestRuntimeValue>> => {
+			const epoch = retainedTestEpoch;
+			try {
+				const result = adapter ? await adapter.load(signal, active) : { kind: "clear" } as const;
+				if (signal.aborted || epoch !== retainedTestEpoch) return { kind: "retain" };
+				if (result.kind === "decision" && owner) retainedTestRuntime = { owner, locale, value: result.value };
+				else if (result.kind === "clear" || result.kind === "waiting") invalidateRetainedTestRuntime();
+				return result;
+			} catch (error) {
+				if (!signal.aborted && epoch === retainedTestEpoch && touchpointWithdrawsDisplay(error)) invalidateRetainedTestRuntime();
+				throw error;
+			}
+		},
+		[adapter, owner, locale],
 	);
 	const lifecycle = useTouchpointLifecycle<TestRuntimeValue>({
 		enabled: compatible && adapter !== null,
@@ -1248,22 +1326,29 @@ export function TestCampaignModal({
 		load,
 		onError: (error) => emitWebTouchpointDiagnostic(testLoadDiagnostic(error)),
 	});
-	const authorityRef = useRef(lifecycle.current);
-	authorityRef.current = lifecycle.current;
+	// Only the grant this route mount inherited may fill its initial load gap.
+	// Once a server answer replaces it, the lifecycle owns normal revalidation.
+	const restored = retained === remountValue.current && retained && deployment && sameTestDeployment(retained.deployment, deployment) ? retained : null;
+	const currentValue = lifecycle.current ?? restored;
+	const authorityRef = useRef(currentValue);
+	authorityRef.current = currentValue;
 	const expired = useRef(new WeakSet<TestClock>());
 	const [, expirePlacement] = useState(0);
+	const authorityEpoch = retainedTestEpoch;
 	const isSessionAuthorized = useCallback((placementKey?: TestCampaignPlacement) => {
-		if (!lifecycle.isCurrent(lifecycle.generation)) return false;
-		if (!placementKey) return true;
+		const current = authorityRef.current;
+		if (authorityEpoch !== retainedTestEpoch || !current || document.hidden || !(lifecycle.isCurrent(lifecycle.generation) ||
+			(compatible && retainedTestRuntime?.value === current && retainedTestRuntime.owner === owner && retainedTestRuntime.locale === locale))) return false;
+		if (!placementKey) return [...current.authorizations.values()].some((grant) => testElapsed(grant.received) < grant.validForMs);
 		const grant = authorityRef.current?.authorizations.get(placementKey);
 		return !!grant && !expired.current.has(grant.received) && testElapsed(grant.received) < grant.validForMs;
-	}, [lifecycle.generation, lifecycle.isCurrent]);
+	}, [lifecycle.generation, lifecycle.isCurrent, compatible, owner, locale, authorityEpoch]);
 	// A held placement may end between polls, even while another round is in flight.
 	// Retire that grant once; a later clock correction cannot revive it.
 	const live: TestCampaignPlacement[] = [];
 	let nextExpiry = Infinity;
-	for (const placementKey of lifecycle.current?.decisions.keys() ?? []) {
-		const grant = lifecycle.current!.authorizations.get(placementKey)!;
+	for (const placementKey of currentValue?.decisions.keys() ?? []) {
+		const grant = currentValue!.authorizations.get(placementKey)!;
 		const remaining = grant.validForMs - testElapsed(grant.received);
 		if (remaining <= 0) expired.current.add(grant.received);
 		if (!expired.current.has(grant.received)) {
@@ -1276,10 +1361,10 @@ export function TestCampaignModal({
 		if (!Number.isFinite(nextExpiry)) return;
 		const timer = setTimeout(() => expirePlacement((tick) => tick + 1), nextExpiry);
 		return () => clearTimeout(timer);
-	}, [lifecycle.current, nextExpiry]);
+	}, [currentValue, nextExpiry]);
 	// Publish a new session only when the lease or its live placements change.
 	const runtimeSession = useMemo(() => {
-		const current = lifecycle.current;
+		const current = currentValue;
 		if (!current) return null;
 		const keys = liveKey ? (liveKey.split("\n") as TestCampaignPlacement[]) : [];
 		return Object.freeze<TestRuntimeSession>({
@@ -1287,11 +1372,11 @@ export function TestCampaignModal({
 			decisions: new Map(keys.map((key) => [key, current.decisions.get(key)!])),
 			isAuthorized: isSessionAuthorized,
 		});
-	}, [lifecycle.current, liveKey, isSessionAuthorized]);
+	}, [currentValue, liveKey, isSessionAuthorized]);
 	useEffect(() => {
 		if (!deployment) {
 			publishedSession.current = null;
-			clearTestRuntimeSession();
+			unpublishTestRuntimeSession();
 			return;
 		}
 		const session =
@@ -1315,7 +1400,7 @@ export function TestCampaignModal({
 	useEffect(
 		() => () => {
 			if (currentTestSession === publishedSession.current)
-				clearTestRuntimeSession();
+				unpublishTestRuntimeSession();
 		},
 		[],
 	);

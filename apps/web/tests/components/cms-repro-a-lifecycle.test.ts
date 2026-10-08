@@ -1,11 +1,11 @@
 // @vitest-environment jsdom
-// Ticket acceptance probes. The 2026-10-02 product ruling keeps normal 30s
-// renewal, 5-minute production fallback probes, and Test's short authorization
-// deadline. Historical failures against the prior expectations remain in evidence.
-import { createElement } from "react";
+// Local lifecycle regressions, not real-client acceptance. The 2026-10-02
+// ruling keeps Test's short authorization deadline and 5-minute Production
+// fallback probes; Test failure rechecks below only cover existing behavior.
+import { createElement, StrictMode } from "react";
 import path from "node:path";
 import ts from "typescript";
-import { act, cleanup, render, renderHook } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   REQUEST_TIMEOUT_MS, SERVER_FAULT_HEARTBEAT_MS, touchpointContentIdentity,
@@ -18,11 +18,12 @@ vi.mock("@open-design/host", () => ({
   getOpenDesignHost: () => ({ version: 2, client: { type: "desktop", osLocale: "en-US" } }),
 }));
 vi.mock("../../src/providers/registry", () => ({ openExternalUrl: vi.fn() }));
-import { TestCampaignModal, clearTestRuntimeSession, useTestRuntime } from "../../src/components/TestCampaignModal";
+import { TestCampaignModal, clearTestRuntimeSession, useTestRuntime, type TestCampaignPlacement } from "../../src/components/TestCampaignModal";
 import { ProductionCampaignBadge } from "../../src/components/ProductionCampaignBadge";
 import { ProductionCampaignModal } from "../../src/components/ProductionCampaignModal";
 import { ProductionCampaignHover } from "../../src/components/ProductionCampaignHover";
 import * as host from "../../src/components/touchpoint-component";
+import { I18nProvider, type Locale } from "../../src/i18n";
 
 const T0 = Date.parse("2030-01-01T00:00:00Z");
 const at = (ms: number) => new Date(T0 + ms).toISOString();
@@ -286,7 +287,7 @@ describe("production component acceptance", () => {
 });
 
 describe("OPEND-3436 Test channel", () => {
-  function setupTest() {
+  function setupTest(authorizationMs = placements.map(() => 60_000)) {
     let failed = false;
     let recovered = false;
     const fetchMock = vi.fn(async (url: string) => {
@@ -298,16 +299,17 @@ describe("OPEND-3436 Test channel", () => {
       return json({
         ...decision(placement),
         serverTime: recovered ? new Date(Date.now()).toISOString() : at(0),
-        authorizationExpiresAt: recovered ? new Date(Date.now() + 60_000).toISOString() : at(60_000),
+        authorizationExpiresAt: recovered ? new Date(Date.now() + 60_000).toISOString() : at(authorizationMs[placements.indexOf(placement)]!),
         testContext: context,
       });
     });
     vi.stubGlobal("fetch", fetchMock);
-    const view = render(createElement(TestCampaignModal, { authenticated: true, sessionSubject: "A" }));
+    const element = (authenticated = true, sessionSubject: string | null = "A", locale: Locale = "en") => createElement(I18nProvider, { initial: locale, children: createElement(TestCampaignModal, { authenticated, sessionSubject }) });
+    let view = render(element());
     const probe = renderHook(() => useTestRuntime());
-    return { fetchMock, probe, fail: () => { failed = true; }, recover: () => { failed = false; recovered = true; }, restart: () => {
+    return { fetchMock, probe, fail: () => { failed = true; }, recover: () => { failed = false; recovered = true; }, change: (authenticated: boolean, sessionSubject: string | null = "A") => view.rerender(element(authenticated, sessionSubject)), restart: (sessionSubject: string | null = "A", locale: Locale = "en", strict = false) => {
       view.unmount();
-      render(createElement(TestCampaignModal, { authenticated: true, sessionSubject: "A" }));
+      view = render(strict ? createElement(StrictMode, null, element(true, sessionSubject, locale)) : element(true, sessionSubject, locale));
     } };
   }
   // Product ruling, 2026-10-02: Test does not extend offline authority to
@@ -349,6 +351,199 @@ describe("OPEND-3436 Test channel", () => {
     recover(); wake("online"); await step();
     expect(probe.result.current?.decisions.size).toBe(4);
     expect(probe.result.current?.isAuthorized()).toBe(true);
+  });
+  it("AC4/10 Test restores all four still-authorized decisions after immediate offline remount without renewing their clocks", async () => {
+    const { probe, fail, restart } = setupTest(); await step();
+    expect(probe.result.current?.decisions.size).toBe(4);
+    fail(); restart(); await step();
+    expect(probe.result.current?.decisions.size).toBe(4);
+    for (const placement of placements) expect(probe.result.current?.isAuthorized(placement as TestCampaignPlacement)).toBe(true);
+    await step(59_999);
+    expect(probe.result.current?.decisions.size).toBe(4);
+    await step(1);
+    expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+    expect(probe.result.current?.isAuthorized() ?? false).toBe(false);
+  });
+  it("remount after twenty seconds preserves only the original forty seconds and the existing failure retry schedule", async () => {
+    const { probe, fetchMock, fail, restart } = setupTest(); await step(); await step(20_000);
+    fail(); restart(); await step();
+    expect(probe.result.current?.decisions.size).toBe(4);
+    const requests = fetchMock.mock.calls.length;
+    await step(999); expect(fetchMock.mock.calls.length).toBe(requests);
+    await step(1); expect(fetchMock.mock.calls.length).toBeGreaterThan(requests);
+    await step(38_999); expect(probe.result.current?.decisions.size).toBe(4);
+    await step(1); expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+  });
+  it("restored placements independently retire at their original fifteen-second boundaries", async () => {
+    const { probe, fail, restart } = setupTest([15_000, 30_000, 45_000, 60_000]); await step(); await step(10_000);
+    fail(); restart(); await step();
+    for (let index = 0; index < placements.length; index += 1) {
+      await step(index === 0 ? 4_999 : 14_999);
+      expect(probe.result.current?.decisions.size).toBe(4 - index);
+      await step(1);
+      expect(probe.result.current?.decisions.size ?? 0).toBe(3 - index);
+      expect(probe.result.current?.isAuthorized(placements[index] as TestCampaignPlacement)).toBe(false);
+    }
+  });
+  it.each(["account", "logout", "locale"] as const)("never restores old grants after %s changes and changes back", async (boundary) => {
+    const { probe, fail, restart, change } = setupTest(); await step(); fail();
+    if (boundary === "account") restart("B");
+    else if (boundary === "logout") change(false);
+    else restart("A", "ja");
+    await step(); expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+    restart(); await step(); expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+  });
+  it("a forward clock observation followed by rollback cannot resurrect a restored grant", async () => {
+    const { probe, fail, restart } = setupTest(); await step(); await step(20_000); fail();
+    vi.setSystemTime(T0 + 60_001); restart(); await step();
+    expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+    vi.setSystemTime(T0 + 20_000); restart(); await step();
+    expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+  });
+  it.each([401, 403, 410, "empty", "snapshot"] as const)("authoritative directory %s prevents subsequent offline remount", async (answer) => {
+    const { probe, fetchMock, fail, restart } = setupTest(); await step(); fail(); restart(); await step();
+    expect(probe.result.current?.decisions.size).toBe(4);
+    fetchMock.mockImplementation(async (url: string) => {
+      if (String(url).includes("deployments")) return typeof answer === "number" ? new Response(null, { status: answer }) : json({ deployments: answer === "empty" ? [] : [{ id: "deployment-1", activityId: "activity-1", snapshotHash: "changed", snapshot: { placementKeys: placements } }] });
+      throw new TypeError("DNS unavailable");
+    });
+    wake("online"); await step(); expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+    fetchMock.mockRejectedValue(new TypeError("DNS unavailable")); restart(); await step();
+    expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+  });
+  it.each([401, 403, 410])("runtime refusal %s cancels old siblings and cannot be replayed after offline remount", async (status) => {
+    const { probe, fetchMock, restart } = setupTest(); await step();
+    const original = fetchMock.getMockImplementation()!;
+    const pending: Array<() => void> = [];
+    fetchMock.mockImplementation(async (url: string) => {
+      if (!String(url).includes("placementKey")) return original(url);
+      const placement = new URL(url, "http://localhost").searchParams.get("placementKey")!;
+      if (placement === placements[0]) return new Response(null, { status });
+      return new Promise<Response>((resolve) => pending.push(() => resolve(json({ ...decision(placement), authorizationExpiresAt: at(60_000), testContext: { deploymentId: "deployment-1", scenario: "realtime", updatedAt: at(0), scheduleState: "active" } }))));
+    });
+    await step(30_000); expect(pending).toHaveLength(3);
+    await act(async () => { pending.forEach((resolve) => resolve()); });
+    expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+    fetchMock.mockRejectedValue(new TypeError("DNS unavailable")); restart(); await step();
+    expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+  });
+  it("an empty directory fences a late pre-remount renewal even when fetch ignores abort", async () => {
+    const { probe, fetchMock, restart } = setupTest(); await step();
+    const original = fetchMock.getMockImplementation()!;
+    const pending: Array<() => void> = [];
+    fetchMock.mockImplementation(async (url: string) => {
+      if (!String(url).includes("placementKey")) return original(url);
+      return new Promise<Response>((resolve) => pending.push(() => void original(url).then(resolve)));
+    });
+    await step(30_000); expect(pending).toHaveLength(4);
+    fetchMock.mockImplementation(async () => json({ deployments: [] })); restart(); await step();
+    expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+    await act(async () => { pending.forEach((resolve) => resolve()); });
+    fetchMock.mockRejectedValue(new TypeError("DNS unavailable")); restart(); await step();
+    expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+  });
+  it.each(["unknown owner", "explicit clear"])("%s cannot reuse a grant on another same-owner remount", async (boundary) => {
+    const { probe, fail, restart, change } = setupTest(); await step();
+    if (boundary === "unknown owner") { change(true, null); await step(); }
+    else clearTestRuntimeSession();
+    fail(); restart(); await step(); expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+  });
+  it("StrictMode remount retains valid grants and accepts a genuinely fresh in-flight renewal after their original deadline", async () => {
+    const { probe, fetchMock, fail, restart } = setupTest(); await step(); await step(20_000); fail();
+    restart("A", "en", true); await step(); expect(probe.result.current?.decisions.size).toBe(4);
+    await step(39_000);
+    const pending: Array<() => void> = [];
+    const context = { deploymentId: "deployment-1", scenario: "realtime", updatedAt: at(0), scheduleState: "active" };
+    fetchMock.mockImplementation(async (url: string) => {
+      if (String(url).includes("deployments")) throw new TypeError("DNS unavailable");
+      if (String(url).includes("context")) return json(context);
+      const placement = new URL(url, "http://localhost").searchParams.get("placementKey")!;
+      return new Promise<Response>((resolve) => pending.push(() => resolve(json({ ...decision(placement), serverTime: at(59_000), authorizationExpiresAt: at(119_000), testContext: context }))));
+    });
+    wake("online"); await step(); expect(pending).toHaveLength(4);
+    await step(1_000); expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+    await act(async () => { pending.forEach((resolve) => resolve()); });
+    expect(probe.result.current?.decisions.size).toBe(4);
+    fail(); fetchMock.mockRejectedValue(new TypeError("DNS unavailable")); restart(); await step();
+    expect(probe.result.current?.decisions.size).toBe(4);
+    await step(58_999); expect(probe.result.current?.decisions.size).toBe(4);
+    await step(1); expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+  });
+  it("an unidentified owner may display a fresh grant but cannot replay it on remount", async () => {
+    const { probe, fail, restart } = setupTest(); await step(); restart(null); await step();
+    expect(probe.result.current?.decisions.size).toBe(4);
+    fail(); restart(null); await step(); expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+  });
+  it.each(["directory 404", "directory malformed", "runtime 404", "runtime malformed"])("%s preserves only the existing short grant through remount", async (failure) => {
+    const { probe, fetchMock, restart } = setupTest(); await step();
+    const original = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url: string) => {
+      const matches = failure.startsWith("directory") ? String(url).includes("deployments") : String(url).includes("placementKey");
+      if (matches) return failure.endsWith("404") ? new Response(null, { status: 404 }) : json({});
+      return original(url);
+    });
+    await step(30_000); expect(probe.result.current?.decisions.size).toBe(4);
+    fetchMock.mockRejectedValue(new TypeError("DNS unavailable")); restart(); await step();
+    expect(probe.result.current?.decisions.size).toBe(4);
+    // A directory failure allows the successful runtime renewal at t=30s.
+    const remaining = failure.startsWith("directory") ? 60_000 : 30_000;
+    await step(remaining - 1); expect(probe.result.current?.decisions.size).toBe(4);
+    await step(1); expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+  });
+  it("manual switching spends the old selection's replay grant even when switching back offline", async () => {
+    const originalUrl = window.location.href;
+    window.history.replaceState(null, "", "?cmsTestControls=1");
+    try {
+      const { probe, fetchMock, fail, restart } = setupTest(); await step();
+      const original = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation(async (url: string) => {
+        const response = await original(url);
+        if (!String(url).includes("deployments")) return response;
+        const body = await response.json();
+        return json({ deployments: [...body.deployments, { ...body.deployments[0], id: "deployment-2" }] });
+      });
+      wake("focus"); await step();
+      fireEvent.change(document.querySelector("select")!, { target: { value: "deployment-1" } }); await step();
+      expect(probe.result.current?.decisions.size).toBe(4);
+      fail();
+      fireEvent.change(document.querySelector("select")!, { target: { value: "deployment-2" } }); await step();
+      expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+      fireEvent.change(document.querySelector("select")!, { target: { value: "deployment-1" } }); await step();
+      expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+      restart(); await step(); expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+    } finally { window.history.replaceState(null, "", originalUrl); }
+  });
+  it("a remount renewal with one hung placement keeps its original grant while siblings receive fresh grants", async () => {
+    const { probe, fetchMock, restart } = setupTest(); await step(); await step(20_000);
+    const original = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url: string) => {
+      if (!String(url).includes("placementKey")) return original(url);
+      const placement = new URL(url, "http://localhost").searchParams.get("placementKey")!;
+      if (placement === placements[0]) return new Promise<Response>(() => {});
+      const body = await (await original(url)).json();
+      return json({ ...body, serverTime: at(20_000), authorizationExpiresAt: at(80_000) });
+    });
+    restart(); await step(); expect(probe.result.current?.decisions.size).toBe(4);
+    await step(10_000); expect(probe.result.current?.decisions.size).toBe(4);
+    expect(probe.result.current?.isAuthorized(placements[0] as TestCampaignPlacement)).toBe(true);
+    fetchMock.mockRejectedValue(new TypeError("DNS unavailable"));
+    await step(29_999); expect(probe.result.current?.decisions.size).toBe(4);
+    await step(1); expect(probe.result.current?.decisions.size).toBe(3);
+    expect(probe.result.current?.isAuthorized(placements[0] as TestCampaignPlacement)).toBe(false);
+    await step(19_999); expect(probe.result.current?.decisions.size).toBe(3);
+    await step(1); expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+  });
+  it("withdrawal spends inherited grants for future requests as well as requests already in flight", async () => {
+    const { probe, fetchMock, fail, restart } = setupTest(); await step(); fail(); restart(); await step();
+    expect(probe.result.current?.decisions.size).toBe(4);
+    const context = { deploymentId: "deployment-1", scenario: "realtime", updatedAt: at(0), scheduleState: "active" };
+    fetchMock.mockImplementation(async (url: string) => String(url).includes("context") ? json(context) : new Response(null, { status: 401 }));
+    await step(10_000); wake("online"); await step();
+    expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+    fetchMock.mockImplementation(() => new Promise<Response>(() => {}));
+    await step(30_000);
+    expect(probe.result.current?.decisions.size ?? 0).toBe(0);
+    expect(probe.result.current?.isAuthorized() ?? false).toBe(false);
   });
 });
 

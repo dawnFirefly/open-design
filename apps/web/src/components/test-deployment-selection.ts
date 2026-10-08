@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { emitWebTouchpointDiagnostic } from "./touchpoint-component";
 import { RETRY_BACKOFF_MS } from "./touchpoint-lifecycle";
 import type { TouchpointStaticAction } from "./touchpoint-static-actions";
@@ -100,7 +100,7 @@ function canonical(value: unknown): string {
 			.join(",")}}`;
 	return JSON.stringify(value) ?? "null";
 }
-function sameDeployment(left: TestDeployment, right: TestDeployment): boolean {
+export function sameTestDeployment(left: TestDeployment, right: TestDeployment): boolean {
 	return (
 		left.id === right.id &&
 		left.activityId === right.activityId &&
@@ -124,18 +124,29 @@ export function useTestDeploymentSelection({
 	enabled,
 	owner,
 	manual,
+	initialSelection = null,
+	onSelection,
 }: {
 	enabled: boolean;
 	owner: string | null;
 	manual: boolean;
+	/** An already-authorized in-process selection, never an offline directory grant. */
+	initialSelection?: TestDeployment | null;
+	onSelection?: (selected: TestDeployment | null) => void;
 }) {
 	const [state, setState] = useState<SelectionState>({
-		owner: null,
-		deployments: empty,
-		selected: null,
+		owner,
+		deployments: enabled && initialSelection ? [initialSelection] : empty,
+		selected: enabled ? initialSelection : null,
 	});
+	// Response acceptance and manual commands update this ref before publishing
+	// React state. Their authority effects never run inside a replayable updater.
+	const stateRef = useRef(state);
 	useEffect(() => {
-		setState({ owner, deployments: empty, selected: null });
+		if (!enabled || stateRef.current.owner !== owner) {
+			stateRef.current = { owner, deployments: empty, selected: null };
+			setState(stateRef.current);
+		}
 		if (!enabled) return;
 		let disposed = false;
 		let request: AbortController | null = null;
@@ -176,33 +187,42 @@ export function useTestDeploymentSelection({
 					signal: controller.signal,
 				});
 				if (!current()) return;
-				if (!response.ok) throw new Error("touchpoint_test_catalog_failed");
+				if (!response.ok) {
+					if ([401, 403, 410].includes(response.status)) {
+						onSelection?.(null);
+						stateRef.current = { owner, deployments: empty, selected: null };
+						setState(stateRef.current);
+					}
+					throw new Error("touchpoint_test_catalog_failed");
+				}
 				const deployments = readDirectory(await response.json());
 				if (!current()) return;
 				retryIndex = 0;
-				setState((previous) => {
-					if (disposed) return previous;
+				{
+					const previous = stateRef.current;
 					const old =
 						previous.owner === owner
 							? previous
 							: { owner, deployments: empty, selected: null };
 					const stable = deployments.map((next) => {
 						const existing = old.deployments.find((value) => value.id === next.id);
-						return existing && sameDeployment(existing, next) ? existing : next;
+						return existing && sameTestDeployment(existing, next) ? existing : next;
 					});
 					// Normal clients follow the server's newest-first order; debug selection stays manual.
 					const selected =
 						(manual
 							? stable.find((value) => value.id === old.selected?.id)
 							: stable[0]) ?? null;
+					onSelection?.(selected);
 					if (
 						old.selected === selected &&
 						old.deployments.length === stable.length &&
 						old.deployments.every((value, index) => value === stable[index])
 					)
-						return previous;
-					return { owner, deployments: stable, selected };
-				});
+						return;
+					stateRef.current = { owner, deployments: stable, selected };
+					setState(stateRef.current);
+				}
 			} catch (error) {
 				if (current()) {
 					emitWebTouchpointDiagnostic({
@@ -244,21 +264,24 @@ export function useTestDeploymentSelection({
 			window.removeEventListener("offline", cancel);
 			document.removeEventListener("visibilitychange", visibility);
 		};
-	}, [enabled, owner, manual]);
+	}, [enabled, owner, manual, onSelection]);
 
 	const select = useCallback(
 		(id: string) => {
 			if (!enabled || !manual) return;
-			setState((previous) => {
-				if (previous.owner !== owner) return previous;
+			{
+				const previous = stateRef.current;
+				if (previous.owner !== owner) return;
 				const selected =
 					previous.deployments.find((deployment) => deployment.id === id) ?? null;
-				return previous.selected === selected
-					? previous
-					: { ...previous, selected };
-			});
+				if (previous.selected !== selected) onSelection?.(null);
+				if (previous.selected !== selected) {
+					stateRef.current = { ...previous, selected };
+					setState(stateRef.current);
+				}
+			}
 		},
-		[enabled, owner, manual],
+		[enabled, owner, manual, onSelection],
 	);
 	const current = enabled && state.owner === owner;
 	return {
